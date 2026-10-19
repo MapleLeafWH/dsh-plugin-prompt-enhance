@@ -301,5 +301,205 @@ const badAdapterRes = await call(routes[0].handler, {
 })
 check('适配器缺失返回 503 与 NO_ADAPTER', badAdapterRes.status === 503 && badAdapterRes.json().error.code === 'NO_ADAPTER', badAdapterRes.status + ' ' + badAdapterRes.payload.slice(0, 200))
 
+/* ---------------- 8. 配置页：读快照 / 写 profile patch ---------------- */
+function makeEditor(current = {}) {
+  const state = { stored: undefined, edits: 0 }
+  const editor = {
+    documentPath: '/tmp/fake-profile/cordis.patch.yml',
+    entries() {
+      return [{ options: { id: 'prompt-enhance', name: 'dsh-plugin-prompt-enhance', config: current } }]
+    },
+    async edit(entry, change) {
+      state.edits += 1
+      state.stored = change({ ...current }, {})
+    },
+  }
+  return { editor, state }
+}
+
+routes.length = 0
+const editorKit = makeEditor({ provider: '', model: '', timeoutMs: 300000 })
+const settingsCtx = makeCtx({ services: { configEditor: editorKit.editor } })
+apply(settingsCtx.ctx, {})
+const settingsRes = await call(routes[0].handler, { method: 'GET', url: '/prompt-enhance/settings' })
+const settings = settingsRes.json().data
+check('GET settings 返回 200 且可写', settingsRes.status === 200 && settings.canWrite === true, settingsRes.status + ' ' + settingsRes.payload.slice(0, 160))
+check(
+  'GET settings 带回默认模板原文（供「恢复默认」）',
+  typeof settings.templates?.system === 'string' &&
+    settings.templates.system.includes('Prompt Engineering Expert') &&
+    settings.templates.user.includes('{input}'),
+  JSON.stringify(Object.keys(settings.templates ?? {})),
+)
+check(
+  'GET settings 给出默认值与运行模型',
+  settings.defaults?.timeoutMs === 300000 &&
+    settings.defaults?.enabled === true &&
+    settings.runtime?.provider === 'deepseek-account' &&
+    settings.runtime?.source === 'agentDefaultModel',
+  JSON.stringify({ defaults: settings.defaults, runtime: settings.runtime }),
+)
+
+const saveRes = await call(routes[0].handler, {
+  method: 'PUT',
+  url: '/prompt-enhance/settings',
+  body: JSON.stringify({
+    config: {
+      enabled: false,
+      provider: '  p1  ',
+      model: 'm1',
+      timeoutMs: 5000,
+      maxTokens: 100,
+      temperature: null,
+      userTemplate: 'Q: {input}',
+      priceInputPerM: 2,
+      priceOutputPerM: 8,
+    },
+  }),
+})
+const saveBody = saveRes.json()
+const stored = editorKit.state.stored
+check('PUT settings 调用 configEditor.edit', saveRes.status === 200 && saveBody.data?.saved === true && editorKit.state.edits === 1, saveRes.status + ' ' + saveRes.payload.slice(0, 160))
+check('保存值会 trim provider', stored?.provider === 'p1' && stored?.model === 'm1', JSON.stringify(stored))
+check('与默认值相同的项不写入 patch（temperature=null 被清掉）', stored !== undefined && !Object.hasOwn(stored, 'temperature'), JSON.stringify(stored))
+check(
+  '显式改动的项写进 patch',
+  stored?.enabled === false && stored?.timeoutMs === 5000 && stored?.maxTokens === 100 && stored?.userTemplate === 'Q: {input}',
+  JSON.stringify(stored),
+)
+
+const builtinTemplates = settingsRes.json().data.templates
+editorKit.state.stored = undefined
+const sameTemplateSave = await call(routes[0].handler, {
+  method: 'PUT',
+  url: '/prompt-enhance/settings',
+  body: JSON.stringify({ config: { systemPrompt: builtinTemplates.system, userTemplate: builtinTemplates.user } }),
+})
+const sameTemplateStored = editorKit.state.stored
+check(
+  '逐字相同的内置模板不算覆盖（不写进 patch）',
+  sameTemplateSave.status === 200 &&
+    sameTemplateStored !== undefined &&
+    !Object.hasOwn(sameTemplateStored, 'systemPrompt') &&
+    !Object.hasOwn(sameTemplateStored, 'userTemplate'),
+  JSON.stringify({ status: sameTemplateSave.status, stored: sameTemplateStored }),
+)
+
+const customTemplateSave = await call(routes[0].handler, {
+  method: 'PUT',
+  url: '/prompt-enhance/settings',
+  body: JSON.stringify({ config: { userTemplate: 'CUSTOM {input}' } }),
+})
+check(
+  '自定义模板会写进 patch',
+  customTemplateSave.status === 200 && editorKit.state.stored?.userTemplate === 'CUSTOM {input}',
+  JSON.stringify(editorKit.state.stored),
+)
+
+const invalidField = await call(routes[0].handler, {
+  method: 'PUT',
+  url: '/prompt-enhance/settings',
+  body: JSON.stringify({ config: { nonsense: 1 } }),
+})
+check('未知配置项返回 400', invalidField.status === 400 && invalidField.json().error.field === 'nonsense', invalidField.status + ' ' + invalidField.payload.slice(0, 160))
+
+const invalidTimeout = await call(routes[0].handler, {
+  method: 'PUT',
+  url: '/prompt-enhance/settings',
+  body: JSON.stringify({ config: { timeoutMs: 10 } }),
+})
+check('timeoutMs 越界返回 400', invalidTimeout.status === 400 && invalidTimeout.json().error.field === 'timeoutMs', invalidTimeout.status + ' ' + invalidTimeout.payload.slice(0, 160))
+
+const invalidTemplate = await call(routes[0].handler, {
+  method: 'PUT',
+  url: '/prompt-enhance/settings',
+  body: JSON.stringify({ config: { userTemplate: '没有占位符' } }),
+})
+check('user 模板缺 {input} 返回 400', invalidTemplate.status === 400 && invalidTemplate.json().error.field === 'userTemplate', invalidTemplate.status + ' ' + invalidTemplate.payload.slice(0, 160))
+
+const invalidCurrency = await call(routes[0].handler, {
+  method: 'PUT',
+  url: '/prompt-enhance/settings',
+  body: JSON.stringify({ config: { currency: 'EUR' } }),
+})
+check('不支持的币种返回 400', invalidCurrency.status === 400 && invalidCurrency.json().error.field === 'currency', invalidCurrency.status + ' ' + invalidCurrency.payload.slice(0, 160))
+
+routes.length = 0
+const noEditorCtx = makeCtx()
+apply(noEditorCtx.ctx, {})
+const noEditorRead = await call(routes[0].handler, { method: 'GET', url: '/prompt-enhance/settings' })
+check('没有 configEditor 时只读（canWrite=false）', noEditorRead.status === 200 && noEditorRead.json().data.canWrite === false, noEditorRead.status + ' ' + noEditorRead.payload.slice(0, 160))
+const noEditorSave = await call(routes[0].handler, {
+  method: 'PUT',
+  url: '/prompt-enhance/settings',
+  body: JSON.stringify({ config: { provider: 'p' } }),
+})
+check('没有 configEditor 时保存返回 503', noEditorSave.status === 503 && noEditorSave.json().error.code === 'NO_EDITOR', noEditorSave.status + ' ' + noEditorSave.payload.slice(0, 160))
+
+/* ---------------- 9. 关闭开关 / 自定义模板生效 ---------------- */
+routes.length = 0
+const disabledCtx = makeCtx()
+apply(disabledCtx.ctx, { enabled: false })
+const disabledRes = await call(routes[0].handler, {
+  method: 'POST',
+  url: '/prompt-enhance/enhance',
+  body: JSON.stringify({ text: 'hi' }),
+})
+check('enabled=false 时拒绝增强（409）', disabledRes.status === 409 && disabledRes.json().error.code === 'DISABLED', disabledRes.status + ' ' + disabledRes.payload.slice(0, 160))
+
+routes.length = 0
+const overrideCtx = makeCtx()
+apply(overrideCtx.ctx, { systemPrompt: 'CUSTOM SYSTEM', userTemplate: 'Q: {input}' })
+await call(routes[0].handler, {
+  method: 'POST',
+  url: '/prompt-enhance/enhance',
+  body: JSON.stringify({ text: 'hi' }),
+})
+const overrideOptions = overrideCtx.calls.options
+check(
+  '自定义 system / user 模板覆盖默认值',
+  overrideOptions?.system === 'CUSTOM SYSTEM' && overrideOptions?.messages?.[0]?.content?.[0]?.text === 'Q: hi',
+  JSON.stringify({ system: overrideOptions?.system, user: overrideOptions?.messages?.[0]?.content?.[0]?.text }),
+)
+
+/* ---------------- 10. 用量与费用统计 ---------------- */
+routes.length = 0
+const usageCtx = makeCtx({
+  llmStream: async function* stream() {
+    yield { type: 'text-delta', index: 0, text: '带用量' }
+    yield { type: 'usage', usage: { inputTokens: 1000, outputTokens: 500, cacheReadTokens: 200, totalTokens: 1500 } }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  },
+})
+apply(usageCtx.ctx, { priceInputPerM: 2, priceOutputPerM: 8 })
+const usageRes = await call(routes[0].handler, {
+  method: 'POST',
+  url: '/prompt-enhance/enhance',
+  body: JSON.stringify({ text: 'hi' }),
+})
+const usageBody = usageRes.json().data
+check(
+  '响应带回 token 用量',
+  usageBody?.usage?.inputTokens === 1000 && usageBody?.usage?.outputTokens === 500,
+  JSON.stringify(usageBody?.usage),
+)
+check(
+  '按配置单价估算费用（1000/1M*2 + 500/1M*8）',
+  Math.abs((usageBody?.cost ?? 0) - 0.006) < 1e-9 && usageBody?.currency === 'CNY',
+  JSON.stringify({ cost: usageBody?.cost, currency: usageBody?.currency }),
+)
+const statsRes = await call(routes[0].handler, { method: 'GET', url: '/prompt-enhance/settings' })
+const statsBody = statsRes.json().data.stats
+check(
+  '累计统计包含本次调用',
+  statsBody?.calls >= 1 && statsBody?.ok >= 1 && statsBody?.inputTokens >= 1000 && statsBody?.outputTokens >= 500,
+  JSON.stringify(statsBody),
+)
+check(
+  '统计里保留最近一次调用摘要',
+  statsBody?.last?.ok === true && statsBody?.last?.provider === 'deepseek-account',
+  JSON.stringify(statsBody?.last),
+)
+
 console.log('\n' + pass + ' passed, ' + fail + ' failed')
 process.exit(fail === 0 ? 0 : 1)

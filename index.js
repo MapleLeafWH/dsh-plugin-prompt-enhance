@@ -20,6 +20,29 @@ const MAX_DRAFT_CHARS = 20_000
 /** WorkBuddy 侧 sidecar 请求超时（3e5ms）对齐。 */
 const DEFAULT_TIMEOUT_MS = 300_000
 
+/** 本插件在 profile 组合里的 Loader 条目 id（cordis.patch.yml 的 insert.id）。 */
+const ENTRY_ID = 'prompt-enhance'
+/** 模板类配置的上限，防止把整本手册塞进 patch。 */
+const MAX_TEMPLATE_CHARS = 20_000
+
+/**
+ * 配置默认值。「空对象即全部默认」：保存时与默认值相同的键会被清掉，
+ * 于是「恢复默认」等价于把那一项删掉，profile patch 里不会留冗余行。
+ */
+const DEFAULTS = Object.freeze({
+  enabled: true,
+  provider: '',
+  model: '',
+  timeoutMs: DEFAULT_TIMEOUT_MS,
+  maxTokens: null,
+  temperature: null,
+  priceInputPerM: 0,
+  priceOutputPerM: 0,
+  currency: 'CNY',
+  systemPrompt: '',
+  userTemplate: '',
+})
+
 /**
  * 与 WorkBuddy 5.8.3 主进程常量 `zn` 逐字一致（仅去掉源码行首制表符）。
  * 这是增强效果的「产品定义」：只给分析流程 + 改写原则 + 5 条红线，
@@ -117,8 +140,175 @@ User input is in Chinese → Response must be in Chinese.
 GOOD OUTPUT EXAMPLE:
 请解释这段代码的主要功能、执行流程和关键逻辑，并指出可能需要注意的边界情况。`
 
-function userPromptFor(draft) {
-  return USER_TEMPLATE.replace('{input}', draft)
+/** 数字字段：非法/越界一律当「没配」，回落到默认值。 */
+function numberInRange(value, min, max) {
+  if (value === null || value === undefined || value === '') return null
+  const n = Number(value)
+  if (!Number.isFinite(n) || n < min || n > max) return null
+  return n
+}
+
+/** 把任意（可能残缺、可能被手改坏的）config 归一成下发给运行时的有效配置。 */
+function effectiveConfig(raw) {
+  const source = raw !== null && typeof raw === 'object' ? raw : {}
+  const text = (key, max) => (typeof source[key] === 'string' ? source[key].trim().slice(0, max) : '')
+  return {
+    enabled: source.enabled === undefined ? DEFAULTS.enabled : source.enabled !== false,
+    provider: text('provider', 200),
+    model: text('model', 200),
+    timeoutMs: numberInRange(source.timeoutMs, 1000, 600000) ?? DEFAULTS.timeoutMs,
+    maxTokens: numberInRange(source.maxTokens, 1, 200_000),
+    temperature: numberInRange(source.temperature, 0, 2),
+    priceInputPerM: numberInRange(source.priceInputPerM, 0, 100_000) ?? 0,
+    priceOutputPerM: numberInRange(source.priceOutputPerM, 0, 100_000) ?? 0,
+    currency: source.currency === 'USD' ? 'USD' : 'CNY',
+    systemPrompt: typeof source.systemPrompt === 'string' ? source.systemPrompt : '',
+    userTemplate: typeof source.userTemplate === 'string' ? source.userTemplate : '',
+  }
+}
+
+const systemPromptFor = (config) => (config.systemPrompt.trim() === '' ? SYSTEM_PROMPT : config.systemPrompt)
+
+/** user 模板必须保留 {input} 占位符，否则草稿会被吞掉，回落到默认模板。 */
+const userTemplateFor = (config) =>
+  config.userTemplate.trim() === '' || !config.userTemplate.includes('{input}') ? USER_TEMPLATE : config.userTemplate
+
+function userPromptFor(draft, config) {
+  return userTemplateFor(config).replace('{input}', draft)
+}
+
+/**
+ * 进程内调用统计。插件配置保存后 Loader 会重新 apply，但模块实例被复用，
+ * 所以这里的累计值不会因为改一次配置就清零。
+ */
+const stats = {
+  calls: 0,
+  ok: 0,
+  failed: 0,
+  inputTokens: 0,
+  outputTokens: 0,
+  cacheReadTokens: 0,
+  cost: 0,
+  last: null,
+}
+
+/** 按配置里的单价估算本次调用费用（单价单位：货币/百万 token）。 */
+function costOf(config, usage) {
+  const input = Number(usage?.inputTokens) || 0
+  const output = Number(usage?.outputTokens) || 0
+  const value = (input / 1e6) * config.priceInputPerM + (output / 1e6) * config.priceOutputPerM
+  return Number.isFinite(value) && value > 0 ? value : 0
+}
+
+function recordCall(entry) {
+  stats.calls += 1
+  if (entry.ok === true) stats.ok += 1
+  else stats.failed += 1
+  if (entry.usage) {
+    stats.inputTokens += Number(entry.usage.inputTokens) || 0
+    stats.outputTokens += Number(entry.usage.outputTokens) || 0
+    stats.cacheReadTokens += Number(entry.usage.cacheReadTokens) || 0
+  }
+  stats.cost += Number(entry.cost) || 0
+  stats.last = entry
+}
+
+/** 保存时只接受白名单字段，逐项校验范围和类型。 */
+function validateConfigPatch(patch) {
+  if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) {
+    return { error: '缺少 config 对象', field: 'config' }
+  }
+  const out = {}
+  const bad = (field, message) => ({ error: message, field })
+
+  for (const [field, value] of Object.entries(patch)) {
+    if (!Object.hasOwn(DEFAULTS, field)) return bad(field, '未知配置项：' + field)
+    switch (field) {
+      case 'enabled': {
+        if (typeof value !== 'boolean') return bad(field, 'enabled 必须是布尔值')
+        out.enabled = value
+        break
+      }
+      case 'provider':
+      case 'model': {
+        if (typeof value !== 'string') return bad(field, field + ' 必须是字符串')
+        if (/[\r\n]/.test(value)) return bad(field, field + ' 不能包含换行')
+        if (value.trim().length > 200) return bad(field, field + ' 过长（上限 200 字符）')
+        out[field] = value.trim()
+        break
+      }
+      case 'timeoutMs': {
+        const n = numberInRange(value, 1000, 600_000)
+        if (n === null) return bad(field, 'timeoutMs 必须在 1000–600000 之间')
+        out.timeoutMs = n
+        break
+      }
+      case 'maxTokens': {
+        if (value === null || value === '') {
+          out.maxTokens = null
+          break
+        }
+        const n = numberInRange(value, 1, 200_000)
+        if (n === null) return bad(field, 'maxTokens 必须在 1–200000 之间，或留空')
+        out.maxTokens = n
+        break
+      }
+      case 'temperature': {
+        if (value === null || value === '') {
+          out.temperature = null
+          break
+        }
+        const n = numberInRange(value, 0, 2)
+        if (n === null) return bad(field, 'temperature 必须在 0–2 之间，或留空')
+        out.temperature = n
+        break
+      }
+      case 'priceInputPerM':
+      case 'priceOutputPerM': {
+        const n = numberInRange(value, 0, 100_000)
+        if (n === null) return bad(field, field + ' 必须是 0–100000 之间的数字')
+        out[field] = n
+        break
+      }
+      case 'currency': {
+        if (value !== 'CNY' && value !== 'USD') return bad(field, 'currency 只能是 CNY 或 USD')
+        out.currency = value
+        break
+      }
+      case 'systemPrompt': {
+        if (typeof value !== 'string') return bad(field, 'systemPrompt 必须是字符串')
+        if (value.length > MAX_TEMPLATE_CHARS) return bad(field, 'system 模板过长（上限 ' + MAX_TEMPLATE_CHARS + ' 字符）')
+        out.systemPrompt = value
+        break
+      }
+      case 'userTemplate': {
+        if (typeof value !== 'string') return bad(field, 'userTemplate 必须是字符串')
+        if (value.length > MAX_TEMPLATE_CHARS) return bad(field, 'user 模板过长（上限 ' + MAX_TEMPLATE_CHARS + ' 字符）')
+        if (value.trim() !== '' && !value.includes('{input}')) {
+          return bad(field, 'user 模板必须保留 {input} 占位符，否则草稿会丢失')
+        }
+        out.userTemplate = value
+        break
+      }
+      default:
+        return bad(field, '未知配置项：' + field)
+    }
+  }
+  return { value: out }
+}
+
+/** 与默认值相同的键不写进 patch，于是「恢复默认」= 删掉该项。 */
+function storedConfig(config) {
+  const stored = {}
+  for (const [field, value] of Object.entries(config)) {
+    const fallback = DEFAULTS[field]
+    const same =
+      value === fallback ||
+      (value === null && fallback === null) ||
+      (typeof value === 'string' && typeof fallback === 'string' && value === fallback)
+    if (!same) stored[field] = value
+  }
+  return stored
 }
 
 /** 只信任 loopback 同源请求，避免本机其他页面驱动模型调用（抄自 agent-db-ui）。 */
@@ -208,10 +398,16 @@ async function collectText(stream) {
   let text = ''
   let failure = null
   let ended = false
+  let usage = null
   for await (const chunk of stream) {
     if (!chunk || typeof chunk !== 'object') continue
     if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
       text += chunk.text
+      continue
+    }
+    // usage 分片在 finish 之前到达，用来统计本次调用的 token（费用估算的依据）。
+    if (chunk.type === 'usage' && chunk.usage && typeof chunk.usage === 'object') {
+      usage = chunk.usage
       continue
     }
     // 容错：只吃 delta 的实现，若提供方改成整块 text 也能拿到结果。
@@ -234,7 +430,7 @@ async function collectText(stream) {
     }
   }
   if (!ended && failure === null) failure = { kind: 'error', code: 'NO_FINISH', message: '模型流没有给出结束分片' }
-  return { text, failure }
+  return { text, failure, usage }
 }
 
 /**
@@ -249,13 +445,111 @@ function unwrapOutput(raw) {
 }
 
 function createRoutes(scope, config) {
-  const timeoutMs = Number.isFinite(Number(config.timeoutMs)) ? Number(config.timeoutMs) : DEFAULT_TIMEOUT_MS
+  const timeoutMs = config.timeoutMs
   // WorkBuddy 的 sidecar 请求不带 temperature/maxTokens（交给网关默认值）。
   // 这里保持同样行为：只有用户在插件配置里显式写了才下发。
-  const maxTokens = Number.isFinite(Number(config.maxTokens)) ? Number(config.maxTokens) : undefined
-  const temperature = Number.isFinite(Number(config.temperature)) ? Number(config.temperature) : undefined
+  const maxTokens = config.maxTokens === null ? undefined : config.maxTokens
+  const temperature = config.temperature === null ? undefined : config.temperature
+
+  /** 配置页读的那份快照：有效配置 + 默认模板原文 + 运行状态 + 累计统计。 */
+  function settingsSnapshot() {
+    const target = resolveTarget(scope, config)
+    const editor = peek(scope, 'configEditor')
+    return {
+      entryId: ENTRY_ID,
+      // 模板在编辑态展示「生效文本」：没覆盖就是内置原文，用户改回逐字相同即视为未覆盖。
+      config: { ...config, systemPrompt: systemPromptFor(config), userTemplate: userTemplateFor(config) },
+      defaults: { ...DEFAULTS },
+      templates: { system: SYSTEM_PROMPT, user: USER_TEMPLATE },
+      runtime: target === null ? null : { provider: target.provider, model: target.model, source: target.source },
+      stats: {
+        ...stats,
+        last: stats.last === null ? null : { ...stats.last },
+      },
+      canWrite: Boolean(editor && typeof editor.edit === 'function'),
+      patchPath: editor && typeof editor.documentPath === 'string' ? editor.documentPath : null,
+    }
+  }
+
+  async function handleGetSettings(req, res) {
+    sendJson(res, 200, { ok: true, data: settingsSnapshot() })
+  }
+
+  /**
+   * 保存配置：只写当前 profile 的 patch 层（cordis.patch.yml），交给官方
+   * configEditor 完成校验、原子写盘和 Loader 协调——它保留 YAML 注释，
+   * 写完立即热重载本插件，不需要重启应用。
+   */
+  async function handleSaveSettings(req, res) {
+    let body
+    try {
+      body = await readBody(req)
+    } catch (error) {
+      sendJson(res, 400, { ok: false, error: { message: error instanceof Error ? error.message : String(error), code: 'BAD_BODY' } })
+      return
+    }
+    const validated = validateConfigPatch(body && typeof body === 'object' ? body.config ?? body : null)
+    if (validated.error !== undefined) {
+      sendJson(res, 400, {
+        ok: false,
+        error: { message: validated.error, code: 'INVALID_CONFIG', field: validated.field },
+      })
+      return
+    }
+    // 与内置模板逐字相同的文本按「未覆盖」处理：这样「恢复默认」等价于删掉该键，
+    // profile patch 里不会存一份 2 万字的内置 prompt 副本。
+    if (validated.value.systemPrompt !== undefined && validated.value.systemPrompt.trim() === SYSTEM_PROMPT.trim()) {
+      validated.value.systemPrompt = ''
+    }
+    if (validated.value.userTemplate !== undefined && validated.value.userTemplate.trim() === USER_TEMPLATE.trim()) {
+      validated.value.userTemplate = ''
+    }
+    const editor = peek(scope, 'configEditor')
+    if (!editor || typeof editor.edit !== 'function' || typeof editor.entries !== 'function') {
+      sendJson(res, 503, {
+        ok: false,
+        error: { message: '当前宿主没有 configEditor 服务，无法写入 profile 配置', code: 'NO_EDITOR' },
+      })
+      return
+    }
+    const entry = editor.entries().find((row) => row?.options?.id === ENTRY_ID)
+    if (!entry) {
+      sendJson(res, 503, {
+        ok: false,
+        error: { message: '找不到 Loader 条目 ' + ENTRY_ID + '，无法写入 profile 配置', code: 'NO_ENTRY' },
+      })
+      return
+    }
+    const next = { ...config, ...validated.value }
+    try {
+      await editor.edit(entry, () => storedConfig(next))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      scope.logger?.warn?.('[prompt-enhance] 保存配置失败：' + message)
+      sendJson(res, 409, {
+        ok: false,
+        error: { message: '写入 profile 配置失败：' + message, code: 'WRITE_FAILED' },
+      })
+      return
+    }
+    sendJson(res, 200, {
+      ok: true,
+      data: {
+        saved: true,
+        appliesAt: 'loader',
+        config: effectiveConfig(next),
+      },
+    })
+  }
 
   async function handleEnhance(req, res) {
+    if (config.enabled === false) {
+      sendJson(res, 409, {
+        ok: false,
+        error: { message: '提示词增强已在插件设置里关闭', code: 'DISABLED' },
+      })
+      return
+    }
     let body
     try {
       body = await readBody(req)
@@ -288,6 +582,7 @@ function createRoutes(scope, config) {
     }
 
     // 浏览器关掉面板时顺手取消这次模型调用，别让它白跑。
+    const startedAt = Date.now()
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(new Error('增强超时')), timeoutMs)
     if (res && typeof res.on === 'function') {
@@ -306,6 +601,16 @@ function createRoutes(scope, config) {
       } catch (error) {
         clearTimeout(timer)
         const message = error instanceof Error ? error.message : String(error)
+        recordCall({
+          at: startedAt,
+          durationMs: Date.now() - startedAt,
+          ok: false,
+          error: '模型未就绪：' + message,
+          provider: target.provider,
+          model: target.model,
+          usage: null,
+          cost: 0,
+        })
         scope.logger?.warn?.('[prompt-enhance] prepareCall 失败：' + message)
         sendJson(res, 503, {
           ok: false,
@@ -317,8 +622,8 @@ function createRoutes(scope, config) {
 
     const options = {
       ...(prepared && prepared.config ? prepared.config : request),
-      system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: [{ type: 'text', text: userPromptFor(text) }] }],
+      system: systemPromptFor(config),
+      messages: [{ role: 'user', content: [{ type: 'text', text: userPromptFor(text, config) }] }],
       signal: controller.signal,
     }
 
@@ -330,12 +635,27 @@ function createRoutes(scope, config) {
       result = {
         text: '',
         failure: { kind: 'error', code: 'THROWN', message: error instanceof Error ? error.message : String(error) },
+        usage: null,
       }
     } finally {
       clearTimeout(timer)
     }
 
+    const durationMs = Date.now() - startedAt
+    const usage = result.usage === null || result.usage === undefined ? null : result.usage
+    const cost = costOf(config, usage)
+
     if (result.failure !== null) {
+      recordCall({
+        at: startedAt,
+        durationMs,
+        ok: false,
+        error: result.failure.message,
+        provider: target.provider,
+        model: target.model,
+        usage,
+        cost,
+      })
       scope.logger?.warn?.('[prompt-enhance] 模型调用失败：' + result.failure.code + ' ' + result.failure.message)
       const timedOut = controller.signal.aborted
       sendJson(res, timedOut ? 504 : 502, {
@@ -345,6 +665,9 @@ function createRoutes(scope, config) {
           code: result.failure.code,
           provider: target.provider,
           model: target.model,
+          usage,
+          cost,
+          durationMs,
         },
       })
       return
@@ -352,12 +675,41 @@ function createRoutes(scope, config) {
 
     const enhanced = unwrapOutput(result.text)
     if (enhanced === '') {
-      sendJson(res, 502, { ok: false, error: { message: '模型返回了空结果' } })
+      recordCall({
+        at: startedAt,
+        durationMs,
+        ok: false,
+        error: '模型返回了空结果',
+        provider: target.provider,
+        model: target.model,
+        usage,
+        cost,
+      })
+      sendJson(res, 502, { ok: false, error: { message: '模型返回了空结果', usage, cost, durationMs } })
       return
     }
+    recordCall({
+      at: startedAt,
+      durationMs,
+      ok: true,
+      error: null,
+      provider: target.provider,
+      model: target.model,
+      usage,
+      cost,
+    })
     sendJson(res, 200, {
       ok: true,
-      data: { text: enhanced, provider: target.provider, model: target.model, via: target.source },
+      data: {
+        text: enhanced,
+        provider: target.provider,
+        model: target.model,
+        via: target.source,
+        usage,
+        cost,
+        currency: config.currency,
+        durationMs,
+      },
     })
   }
 
@@ -368,13 +720,29 @@ function createRoutes(scope, config) {
     }
     const url = new URL(req.url, 'http://localhost')
     const pathname = url.pathname
+    const settingsPath = ROUTE_PREFIX + '/settings'
     try {
       if (req.method === 'POST' && pathname === ROUTE_APPLY) {
         await handleEnhance(req, res)
         return
       }
+      if (pathname === settingsPath) {
+        if (req.method === 'GET') {
+          await handleGetSettings(req, res)
+          return
+        }
+        if (req.method === 'PUT' || req.method === 'POST') {
+          await handleSaveSettings(req, res)
+          return
+        }
+        sendJson(res, 405, { ok: false, error: { message: '配置接口只支持 GET/PUT' } })
+        return
+      }
       if (req.method === 'GET' && (pathname === ROUTE_PREFIX || pathname === ROUTE_PREFIX + '/')) {
-        sendJson(res, 200, { ok: true, data: { plugin: 'prompt-enhance', routes: [ROUTE_APPLY] } })
+        sendJson(res, 200, {
+          ok: true,
+          data: { plugin: 'prompt-enhance', routes: [ROUTE_APPLY, ROUTE_PREFIX + '/settings'] },
+        })
         return
       }
       sendJson(res, 404, { ok: false, error: { message: '未知路由 ' + pathname } })
@@ -410,16 +778,21 @@ function mountRoutes(owner, webServer, config) {
   }
   const effect = owner.effect || owner.ctx?.effect
   if (typeof effect === 'function') effect(() => dispose)
-  owner.logger?.info?.('[prompt-enhance] routes mounted at ' + ROUTE_PREFIX + ' (prompt rev wb-1:1)')
+  owner.logger?.info?.(
+    '[prompt-enhance] routes mounted at ' + ROUTE_PREFIX + ' (prompt rev wb-1:1, config ui rev 1)',
+  )
   return dispose
 }
 
 export const name = 'prompt-enhance'
+/** 内置模板导出给测试与外部审计用（配置页的「恢复默认」也读快照里的同一份文本）。 */
+export { SYSTEM_PROMPT, USER_TEMPLATE }
 
 export function apply(ctx, config = {}) {
+  const resolved = effectiveConfig(config)
   if (typeof ctx.inject === 'function') {
     ctx.inject(['webServer', 'llm'], (scope) => {
-      mountRoutes(scope, scope.webServer, config)
+      mountRoutes(scope, scope.webServer, resolved)
     })
     return
   }
@@ -428,5 +801,5 @@ export function apply(ctx, config = {}) {
     ctx.logger?.warn?.('[prompt-enhance] 当前组合没有 webServer，增强路由不会挂载')
     return
   }
-  mountRoutes(ctx, webServer, config)
+  mountRoutes(ctx, webServer, resolved)
 }

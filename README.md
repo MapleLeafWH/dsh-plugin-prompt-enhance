@@ -85,7 +85,25 @@ Client 半的处理：
 
 ## 配置
 
-在 bundle 自带的 `cordis.patch.yml` 里，也可在 profile 的 `cordis.patch.yml` 用同 id 覆盖：
+配置有三层，优先级从低到高：`DEFAULTS`（代码内默认）→ bundle 的 `cordis.patch.yml` → profile 的 `cordis.patch.yml`（配置页写的就是这一层）。
+
+**方式 A · 插件详情页（推荐）**：「插件」→「已安装插件」→ 提示词增强 →「详情」，页面里直接改：
+
+| 分组 | 配置项 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| 运行状态 | 启用 / 生效模型 / 调用次数 / 成功 / 失败 / tokens / 估算费用 / 写入位置 | — | 只读；统计是进程内累计，重启后清零 |
+| 生成参数 | `enabled` | `true` | 关掉后 ✨ 调用返回 409 `DISABLED` |
+| | `provider` / `model` | 空 | 同时填写才覆盖；空 = 跟随 `agentDefaultModel` |
+| | `timeoutMs` | `300000` | 与 WorkBuddy sidecar 的 3e5ms 对齐；范围 1000–600000 |
+| | `maxTokens` / `temperature` | 空 | 留空 = 不下发，交给适配器默认（与 WorkBuddy 一致） |
+| | `priceInputPerM` / `priceOutputPerM` | `0` | 单价（货币/百万 token），只用于估算 |
+| | `currency` | `CNY` | `CNY` / `USD` |
+| 提示词模板 | `systemPrompt` / `userTemplate` | 内置 WorkBuddy 原文 | 可编辑；`userTemplate` 必须保留 `{input}`；「恢复默认」= 改回内置文本 |
+| 一键试跑 | — | — | 用**已保存**的配置真实调一次模型，展示结果、tokens、耗时、估算费用 |
+
+保存走官方 `configEditor` 服务：保留 profile patch 里的注释、原子写盘、写完后 Loader 重新 apply 本插件，不需要重启应用。与默认值相同的项不会写进 patch，「恢复默认」等于把那一项删掉。模板逐字等于内置原文时同样视为未覆盖。
+
+**方式 B · 手改 YAML**。bundle 自带的 `cordis.patch.yml`，或 profile 的 `cordis.patch.yml`（同 id 覆盖）：
 
 ```yaml
 - id: prompt-enhance
@@ -120,8 +138,8 @@ HMR 有 ~2s 的写稳定延迟；装完 **刷新页面** 就能看到按钮，�
 ## 验证
 
 ```bash
-node test/host-routes.mjs   # 30 项：路由匹配/403/400/200/502/503、prepareCall、system/user 模板、输出去包裹
-node test/client-smoke.mjs  # 26 项：slot 注册、语言包、状态机（增强→点击撤销→Cmd+Z 撤销→手改失效）、失败不覆盖草稿
+node test/host-routes.mjs   # 56 项：路由/403/参数校验/模板/失败映射/prepareCall，以及配置读写、模板归一、用量与费用统计
+node test/client-smoke.mjs  # 54 项：两个 slot 的注册、按钮状态机与撤销、配置面板（骨架/只读/保存/失败/试跑）
 node --check index.js && node --check client.js
 
 # 装好之后：宿主插件路由在 Desktop 的渲染器门禁之后，普通 curl 会拿到 403（预期）
@@ -129,7 +147,7 @@ node --check index.js && node --check client.js
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:43120/prompt-enhance
 ```
 
-两个测试都只用假的 `ctx` / `webServer` / `llm` / `fetch`，不触网、不读写 profile。
+两个测试都只用假的 `ctx` / `webServer` / `llm` / `configEditor` / `fetch`，不触网、不读写 profile。
 
 ## 已知限制
 
@@ -138,13 +156,16 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:43120/prompt-enhance
 - 输入框进入「活动面板」（语音输入展开）时宿主会隐藏整条 standardControls，按钮随之为隐藏 —— 宿主行为，不是 bug。
 - 不做流式回填：一次性拿到整段文本再写入，逻辑简单、撤销语义清晰。
 - 模型调用失败没有重试（`ctx.llm` 本身不含重试，重试在 agent failed-step 层）；直接报错，用户可再点一次。
+- **费用是估算**：`ctx.llm` 的 `usage` 只给 token 数，金额按配置里的单价折算；单价默认 0，所以默认显示 ¥0.0000。没有接 `dsh-cost-meter`（两者账本口径不同，混用会看不懂）。
+- 统计只在本进程内累计（插件重新 apply 不会清零，但重启应用会）。
+- 配置页表格里的「无权限」指宿主没挂 `configEditor` 服务（例如手改 profile 版本较旧）：此时整个面板只读，保存返回 503 `NO_EDITOR`。
 
 ## 文件
 
 ```
 dsh-plugin-prompt-enhance/
-├── index.js            # Host：路由 + LLM 调用
-├── client.js           # Client：slot 按钮 + 状态机
+├── index.js            # Host：增强路由 + 配置读写 + LLM 调用/用量统计
+├── client.js           # Client：输入框 ✨ 按钮 + 插件详情页配置面板
 ├── cordis.patch.yml    # bundle 层：插入 prompt-enhance 条目与默认 config
 ├── package.json        # dsh.bundle.patch / dsh.client 声明
 ├── install.mjs         # 手动安装/卸载脚本
