@@ -1,0 +1,17 @@
+{
+  "meta": {
+    "title": "提示词增强",
+    "description": "一键把输入框草稿改写成更完整、更可执行的提示词，随时可撤销。"
+  },
+  "button": {
+    "title": "增强提示词",
+    "enhancing": "增强中…",
+    "revert": "恢复原文",
+    "cancel": "取消增强"
+  },
+  "error": {
+    "empty": "先写点内容再增强。",
+    "failed": "增强失败：{message}",
+    "timeout": "增强超时，请重试。"
+  }
+}

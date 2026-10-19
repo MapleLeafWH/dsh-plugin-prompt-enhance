@@ -1,0 +1,17 @@
+# dsh bundle layer: 提示词增强（prompt enhance）。
+# Host 半在 loopback web 服务器上注册 /prompt-enhance 前缀路由，
+# 用当前 profile 的默认模型跑一次一次性补全；Client 半在输入框右侧工具条
+# （slot conversation.input.right）加一个 ✨ 按钮：点一下增强，Cmd/Ctrl+Z 或再点一下还原。
+- insert:
+    - id: prompt-enhance
+      name: dsh-plugin-prompt-enhance
+      config:
+        # provider/model 留空 = 跟随 profile 的默认模型（agentDefaultModel）。
+        provider: ''
+        model: ''
+        # 采样参数默认不下发（交给适配器/网关默认值），与 WorkBuddy 一致。
+        # 需要固定随机性时再打开下面两项。
+        # maxTokens: 1200
+        # temperature: 0.4
+        # 单次增强的超时；到点就 abort，避免按钮一直转圈。
+        timeoutMs: 300000

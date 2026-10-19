@@ -1,0 +1,17 @@
+{
+  "meta": {
+    "title": "Prompt Enhance",
+    "description": "One click rewrites the composer draft into a more complete, executable prompt; revert anytime."
+  },
+  "button": {
+    "title": "Enhance prompt",
+    "enhancing": "Enhancing…",
+    "revert": "Revert to original",
+    "cancel": "Cancel enhancement"
+  },
+  "error": {
+    "empty": "Write something first, then enhance it.",
+    "failed": "Enhancement failed: {message}",
+    "timeout": "Enhancement timed out. Try again."
+  }
+}
