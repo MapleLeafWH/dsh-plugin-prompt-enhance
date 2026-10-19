@@ -8,10 +8,19 @@
  * 为什么放在 Host：浏览器端没有模型凭据，也不能直连提供方；Host 的
  * ctx.llm 是唯一受支持的调用路径（见 @deepseek-ai/dsh-llm）。
  *
- * 设计上刻意零 import：profile 里的本地插件经 pnpm link 安装后，裸包名
+ * 设计上刻意零依赖：profile 里的本地插件经 pnpm link 安装后，裸包名
  * （@deepseek-ai/*）解析不到 profile 的依赖树，因此这里只依赖宿主注入的
- * ctx.llm / ctx.webServer，不 import 任何 @deepseek-ai 包。
+ * ctx.llm / ctx.webServer，不静态 import 任何第三方包。
+ *
+ * 唯一例外是费用估算：为了和 dsh-cost-meter 的价目表、峰谷档位、汇率口径完全一致，
+ * 插件在运行时按 profile 目录动态载入它的 lib/pricing.js（纯函数模块），载入失败就
+ * 退回配置里的兜底单价——装了 cost-meter 就有真实估价，没装也不会崩。
  */
+
+import { readFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
+import { dirname, join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 const ROUTE_PREFIX = '/prompt-enhance'
 const ROUTE_APPLY = '/prompt-enhance/enhance'
@@ -188,16 +197,234 @@ const stats = {
   inputTokens: 0,
   outputTokens: 0,
   cacheReadTokens: 0,
-  cost: 0,
+  /** 按 dsh-cost-meter 价目表估算的累计美元成本（本插件的调用不入它的账本）。 */
+  costUsd: 0,
+  /** 没装 cost-meter 时按兜底单价估的累计金额，币种见配置。 */
+  costManual: 0,
   last: null,
 }
 
-/** 按配置里的单价估算本次调用费用（单价单位：货币/百万 token）。 */
-function costOf(config, usage) {
+/** 兜底口径：完全按用户在配置页填的单价算（货币/百万 token）。 */
+function manualCostOf(config, usage) {
   const input = Number(usage?.inputTokens) || 0
   const output = Number(usage?.outputTokens) || 0
   const value = (input / 1e6) * config.priceInputPerM + (output / 1e6) * config.priceOutputPerM
   return Number.isFinite(value) && value > 0 ? value : 0
+}
+
+// ── 费用估算：借用 dsh-cost-meter 的价格表与计价引擎 ─────────────────────────
+
+/**
+ * cost-meter 把账本与配置整体持久化在 `$DSH_HOME/storages/cost-meter/ledger.json`，
+ * 其中 config.prices / priceOverrides / 峰谷与汇率设置就是它界面用的同一份数据。
+ * 直接读文件比调它的 getLocalState()（会顺带刷新余额、可能阻塞十几秒）更轻，
+ * 读不到再退回服务接口。
+ */
+const PRICING_TTL_MS = 60_000
+const pricingCache = {
+  engine: null,
+  engineAt: 0,
+  engineFailedAt: 0,
+  config: null,
+  configAt: 0,
+}
+/** 测试注入点：替换掉「动态载入 cost-meter」这条路径。 */
+let pricingContextForTest = null
+
+export function __setPricingContextForTest(context) {
+  pricingContextForTest = context === undefined ? null : context
+}
+
+export function __resetPricingCacheForTest() {
+  pricingCache.engine = null
+  pricingCache.engineAt = 0
+  pricingCache.engineFailedAt = 0
+  pricingCache.config = null
+  pricingCache.configAt = 0
+}
+
+function profileOf(scope) {
+  const profile = peek(scope, 'profileContext')
+  return profile !== null && typeof profile === 'object' ? profile : {}
+}
+
+/** 动态载入 cost-meter 的纯函数计价引擎（按 profile 目录解析绝对路径）。 */
+async function loadPricingEngine(scope) {
+  const now = Date.now()
+  if (pricingCache.engine !== null && now - pricingCache.engineAt < PRICING_TTL_MS) return pricingCache.engine
+  if (now - pricingCache.engineFailedAt < PRICING_TTL_MS) return null
+  const dir = profileOf(scope).dir
+  if (typeof dir !== 'string' || dir === '') return null
+  try {
+    const require = createRequire(join(dir, 'package.json'))
+    const packageJson = require.resolve('dsh-cost-meter/package.json')
+    const engine = await import(pathToFileURL(join(dirname(packageJson), 'lib', 'pricing.js')).href)
+    pricingCache.engine = engine
+    pricingCache.engineAt = now
+    return engine
+  } catch (error) {
+    pricingCache.engineFailedAt = now
+    scope.logger?.warn?.(
+      '[prompt-enhance] 未能载入 dsh-cost-meter 计价引擎，费用将按兜底单价估算：' + String(error?.message ?? error),
+    )
+    return null
+  }
+}
+
+/** 读 cost-meter 的生效配置（价目表 + 峰谷 + 汇率/币种）。 */
+async function loadCostMeterConfig(scope) {
+  const now = Date.now()
+  if (pricingCache.config !== null && now - pricingCache.configAt < PRICING_TTL_MS) return pricingCache.config
+  const home = profileOf(scope).home
+  if (typeof home === 'string' && home !== '') {
+    try {
+      const raw = await readFile(join(home, 'storages', 'cost-meter', 'ledger.json'), 'utf8')
+      const ledger = JSON.parse(raw)
+      const config = ledger !== null && typeof ledger === 'object' ? ledger.config : null
+      if (config !== null && typeof config === 'object' && config.prices !== undefined) {
+        pricingCache.config = config
+        pricingCache.configAt = now
+        return config
+      }
+    } catch {
+      // 文件缺失/半写：落到服务接口再试一次。
+    }
+  }
+  const service = peek(scope, 'costMeter')
+  if (service === null || service === undefined || typeof service.getLocalState !== 'function') return null
+  try {
+    const state = await service.getLocalState()
+    const config = state !== null && typeof state === 'object' ? state.config : null
+    if (config === null || typeof config !== 'object' || config.prices === undefined) return null
+    pricingCache.config = config
+    pricingCache.configAt = now
+    return config
+  } catch (error) {
+    scope.logger?.warn?.('[prompt-enhance] 读取 dsh-cost-meter 配置失败：' + String(error?.message ?? error))
+    return null
+  }
+}
+
+/** 计价上下文：{ config, engine }；任一不可用就返回 null（走兜底单价）。 */
+async function pricingContext(scope) {
+  if (pricingContextForTest !== null) return pricingContextForTest
+  const [config, engine] = await Promise.all([loadCostMeterConfig(scope), loadPricingEngine(scope)])
+  if (config === null || engine === null) return null
+  return { config, engine }
+}
+
+/** 展示口径：币种/符号/小数位/汇率，与 cost-meter 设置页一致。 */
+function displayOf(config) {
+  const currency = typeof config?.currency === 'string' && config.currency !== '' ? config.currency : 'CNY'
+  const rate = Number(config?.fxRates?.[currency] ?? config?.exchangeRate)
+  const decimals = Number(config?.decimals)
+  return {
+    currency,
+    symbol: typeof config?.symbol === 'string' && config.symbol !== '' ? config.symbol : currency === 'USD' ? '$' : '¥',
+    decimals: Number.isFinite(decimals) ? Math.max(0, Math.min(10, Math.floor(decimals))) : 4,
+    exchangeRate: Number.isFinite(rate) && rate > 0 ? rate : 1,
+  }
+}
+
+/** 本地金额格式化：cost-meter 未加载时用，写法对齐它的 formatMoney。 */
+function formatMoney(value, display) {
+  const amount = Number(value) * (Number.isFinite(display.exchangeRate) && display.exchangeRate > 0 ? display.exchangeRate : 1)
+  const decimals = display.decimals
+  let effective = decimals
+  if (amount > 0 && amount < 10 ** -decimals) effective = decimals + 2
+  const fixed = amount.toFixed(effective)
+  const trimmed = fixed.includes('.') ? fixed.replace(/0+$/, '').replace(/\.$/, '') : fixed
+  return display.symbol + trimmed
+}
+
+function peakOf(config, resolved) {
+  return {
+    enabled: ['deepseek-peak', 'utc-peak'].includes(resolved?.billingMode) && config?.peakEnabled === true,
+    effectiveAtMs: Date.parse(config?.peakEffectiveAt ?? ''),
+    windows: config?.peakWindows,
+    holidays: config?.peakHolidays,
+  }
+}
+
+function tierOf(engine, entry, atMs, peak) {
+  if (typeof engine?.isPeakHour !== 'function') return null
+  if (peak.enabled !== true) return null
+  return engine.isPeakHour(atMs, peak.effectiveAtMs, peak.windows, peak.holidays) ? 'peak' : 'offPeak'
+}
+
+/**
+ * 估算一次调用的费用，返回给面板/接口展示的结构。
+ * - 装了 cost-meter：provider/model/峰谷/汇率全部走它的口径，`usd` 为入账美元值，
+ *   `value` 为按展示币种折算的金额。
+ * - 没装：按配置里的兜底单价估（`value` 即展示币种金额）。
+ */
+async function estimateCost(scope, config, info) {
+  const usage = info.usage ?? null
+  const manual = manualCostOf(config, usage)
+  const context = await pricingContext(scope)
+  if (context === null) {
+    const display = { currency: config.currency, symbol: config.currency === 'USD' ? '$' : '¥', decimals: 4, exchangeRate: 1 }
+    return {
+      source: 'manual',
+      priced: manual > 0,
+      usd: null,
+      value: manual,
+      currency: config.currency,
+      symbol: display.symbol,
+      text: manual > 0 ? formatMoney(manual, display) : null,
+      reason: '未检测到 dsh-cost-meter，按配置里的兜底单价估算（未填单价时为 0）',
+    }
+  }
+  const { config: costConfig, engine } = context
+  const display = displayOf(costConfig)
+  const rawProvider = typeof info.provider === 'string' ? info.provider : ''
+  const wrapped = typeof engine.isWrapperProviderId === 'function' && engine.isWrapperProviderId(rawProvider)
+  const effectiveProvider = wrapped ? engine.wrapperUpstreamProvider(rawProvider) ?? rawProvider : rawProvider
+  const resolved = engine.providerPriceEntryFor(effectiveProvider, info.model, costConfig.prices, {
+    mode: costConfig.priceMatch === 'exact' ? 'exact' : 'auto',
+    overrides: costConfig.priceOverrides,
+  })
+  if (resolved === null || resolved === undefined || resolved.priced !== true) {
+    return {
+      source: 'dsh-cost-meter',
+      priced: false,
+      usd: 0,
+      value: 0,
+      currency: display.currency,
+      symbol: display.symbol,
+      text: null,
+      reason: 'dsh-cost-meter 价目表里没有 ' + effectiveProvider + ' / ' + info.model + ' 的价格',
+    }
+  }
+  const atMs = Number.isFinite(info.atMs) ? info.atMs : Date.now()
+  const peak = peakOf(costConfig, resolved)
+  const buckets = {
+    input: Number(usage?.inputTokens) || 0,
+    output: Number(usage?.outputTokens) || 0,
+    cacheRead: Number(usage?.cacheReadTokens) || 0,
+    cacheWrite: Number(usage?.cacheWriteTokens) || 0,
+    reasoning: Number(usage?.reasoningTokens) || 0,
+  }
+  const official = engine.costOf(buckets, resolved.entry, atMs, peak)
+  const rate = display.exchangeRate
+  const usd = engine.usdFromCost(official, resolved.currency, rate)
+  const text =
+    typeof engine.formatMoney === 'function' ? engine.formatMoney(usd, display) : formatMoney(usd, display)
+  return {
+    source: 'dsh-cost-meter',
+    priced: true,
+    usd,
+    value: usd * rate,
+    currency: display.currency,
+    symbol: display.symbol,
+    exchangeRate: rate,
+    officialCurrency: resolved.currency,
+    billingMode: typeof resolved.billingMode === 'string' ? resolved.billingMode : null,
+    tier: tierOf(engine, resolved.entry, atMs, peak),
+    text,
+    provider: effectiveProvider,
+    model: info.model,
+  }
 }
 
 function recordCall(entry) {
@@ -209,7 +436,11 @@ function recordCall(entry) {
     stats.outputTokens += Number(entry.usage.outputTokens) || 0
     stats.cacheReadTokens += Number(entry.usage.cacheReadTokens) || 0
   }
-  stats.cost += Number(entry.cost) || 0
+  const cost = entry.cost
+  if (cost !== null && typeof cost === 'object' && cost.priced === true) {
+    if (cost.source === 'dsh-cost-meter') stats.costUsd += Number(cost.usd) || 0
+    else stats.costManual += Number(cost.value) || 0
+  }
   stats.last = entry
 }
 
@@ -452,9 +683,88 @@ function createRoutes(scope, config) {
   const temperature = config.temperature === null ? undefined : config.temperature
 
   /** 配置页读的那份快照：有效配置 + 默认模板原文 + 运行状态 + 累计统计。 */
-  function settingsSnapshot() {
+  /**
+   * 费用信息：优先 dsh-cost-meter 的价目表（含峰谷档、汇率、币种），缺装时退回兜底口径。
+   * 面板据此显示「累计费用 / 最近一次费用 / 当前生效单价」，避免只给一个 0 让人猜。
+   */
+  async function pricingSnapshot(target) {
+    const lastCost = stats.last !== null && stats.last.cost ? stats.last.cost : null
+    const lastText = lastCost !== null && typeof lastCost.text === 'string' ? lastCost.text : null
+    const context = await pricingContext(scope)
+    if (context === null) {
+      const display = { currency: config.currency, symbol: config.currency === 'USD' ? '$' : '¥', decimals: 4, exchangeRate: 1 }
+      return {
+        available: false,
+        source: 'manual',
+        display,
+        totalsText: formatMoney(stats.costManual, display),
+        lastText,
+        current: null,
+        note: '未检测到 dsh-cost-meter，费用按配置里的兜底单价估算（未填单价时为 0）。',
+      }
+    }
+    const { config: costConfig, engine } = context
+    const display = displayOf(costConfig)
+    const totalsText =
+      typeof engine.formatMoney === 'function' ? engine.formatMoney(stats.costUsd, display) : formatMoney(stats.costUsd, display)
+    let current = null
+    if (target !== null) {
+      const rawProvider = target.provider
+      const wrapped = typeof engine.isWrapperProviderId === 'function' && engine.isWrapperProviderId(rawProvider)
+      const effectiveProvider = wrapped ? engine.wrapperUpstreamProvider(rawProvider) ?? rawProvider : rawProvider
+      const resolved = engine.providerPriceEntryFor(effectiveProvider, target.model, costConfig.prices, {
+        mode: costConfig.priceMatch === 'exact' ? 'exact' : 'auto',
+        overrides: costConfig.priceOverrides,
+      })
+      if (resolved !== null && resolved !== undefined && resolved.priced === true) {
+        const peak = peakOf(costConfig, resolved)
+        const tierPrices =
+          typeof engine.tierFor === 'function' ? engine.tierFor(resolved.entry, Date.now(), peak) : resolved.entry
+        current = {
+          priced: true,
+          provider: effectiveProvider,
+          model: target.model,
+          officialCurrency: resolved.currency,
+          billingMode: typeof resolved.billingMode === 'string' ? resolved.billingMode : null,
+          tier: tierOf(engine, resolved.entry, Date.now(), peak),
+          input: Number(tierPrices?.cacheMiss ?? 0),
+          cacheHit: Number(tierPrices?.cacheHit ?? 0),
+          output: Number(tierPrices?.output ?? 0),
+        }
+      } else {
+        current = {
+          priced: false,
+          provider: effectiveProvider,
+          model: target.model,
+          officialCurrency: display.currency,
+          billingMode: null,
+          tier: null,
+          input: 0,
+          cacheHit: 0,
+          output: 0,
+        }
+      }
+    }
+    return {
+      available: true,
+      source: 'dsh-cost-meter',
+      display,
+      totalsText,
+      lastText,
+      current,
+      note:
+        '按 dsh-cost-meter 价目表估算（官方价 × 汇率 ' +
+        display.exchangeRate +
+        ' → ' +
+        display.currency +
+        '）；本插件的调用不计入它的账本。',
+    }
+  }
+
+  async function settingsSnapshot() {
     const target = resolveTarget(scope, config)
     const editor = peek(scope, 'configEditor')
+    const pricing = await pricingSnapshot(target)
     return {
       entryId: ENTRY_ID,
       // 模板在编辑态展示「生效文本」：没覆盖就是内置原文，用户改回逐字相同即视为未覆盖。
@@ -466,13 +776,15 @@ function createRoutes(scope, config) {
         ...stats,
         last: stats.last === null ? null : { ...stats.last },
       },
+      pricing,
       canWrite: Boolean(editor && typeof editor.edit === 'function'),
       patchPath: editor && typeof editor.documentPath === 'string' ? editor.documentPath : null,
     }
   }
 
   async function handleGetSettings(req, res) {
-    sendJson(res, 200, { ok: true, data: settingsSnapshot() })
+    const data = await settingsSnapshot()
+    sendJson(res, 200, { ok: true, data })
   }
 
   /**
@@ -609,7 +921,7 @@ function createRoutes(scope, config) {
           provider: target.provider,
           model: target.model,
           usage: null,
-          cost: 0,
+          cost: null,
         })
         scope.logger?.warn?.('[prompt-enhance] prepareCall 失败：' + message)
         sendJson(res, 503, {
@@ -643,7 +955,13 @@ function createRoutes(scope, config) {
 
     const durationMs = Date.now() - startedAt
     const usage = result.usage === null || result.usage === undefined ? null : result.usage
-    const cost = costOf(config, usage)
+    // 费用口径：优先 dsh-cost-meter 的价目表/峰谷/汇率，缺装时用兜底单价。
+    const cost = await estimateCost(scope, config, {
+      provider: target.provider,
+      model: target.model,
+      usage,
+      atMs: startedAt,
+    })
 
     if (result.failure !== null) {
       recordCall({
@@ -707,7 +1025,7 @@ function createRoutes(scope, config) {
         via: target.source,
         usage,
         cost,
-        currency: config.currency,
+        currency: cost.currency,
         durationMs,
       },
     })
@@ -779,7 +1097,7 @@ function mountRoutes(owner, webServer, config) {
   const effect = owner.effect || owner.ctx?.effect
   if (typeof effect === 'function') effect(() => dispose)
   owner.logger?.info?.(
-    '[prompt-enhance] routes mounted at ' + ROUTE_PREFIX + ' (prompt rev wb-1:1, config ui rev 1)',
+    '[prompt-enhance] routes mounted at ' + ROUTE_PREFIX + ' (prompt rev wb-1:1, config ui rev 2)',
   )
   return dispose
 }

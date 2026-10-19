@@ -11,7 +11,7 @@
  */
 import { Readable } from 'node:stream'
 
-const { apply } = await import('../index.js')
+const { apply, __setPricingContextForTest, __resetPricingCacheForTest } = await import('../index.js')
 
 let pass = 0
 let fail = 0
@@ -462,16 +462,65 @@ check(
   JSON.stringify({ system: overrideOptions?.system, user: overrideOptions?.messages?.[0]?.content?.[0]?.text }),
 )
 
-/* ---------------- 10. 用量与费用统计 ---------------- */
-routes.length = 0
-const usageCtx = makeCtx({
-  llmStream: async function* stream() {
-    yield { type: 'text-delta', index: 0, text: '带用量' }
-    yield { type: 'usage', usage: { inputTokens: 1000, outputTokens: 500, cacheReadTokens: 200, totalTokens: 1500 } }
-    yield { type: 'finish', reason: { kind: 'stop' } }
+/* ---------------- 10. 用量与费用统计（dsh-cost-meter 口径） ---------------- */
+/**
+ * 假计价引擎：接口/公式与 dsh-cost-meter 的 lib/pricing.js 一致（三桶价、峰谷、
+ * 汇率折算、formatMoney），用来验证我们的接线，而不要求本机装了这个插件。
+ */
+function makeFakePricing({ prices, display, tierName = 'offPeak', priced = true }) {
+  return {
+    config: {
+      prices,
+      priceMatch: 'auto',
+      priceOverrides: {},
+      currency: display.currency,
+      symbol: display.symbol,
+      decimals: display.decimals,
+      exchangeRate: display.exchangeRate,
+      fxRates: { [display.currency]: display.exchangeRate },
+      peakEnabled: true,
+      peakEffectiveAt: '2026-08-01T00:00:00Z',
+      peakWindows: [{ start: 1, end: 4 }],
+      peakHolidays: [],
+    },
+    engine: {
+      isWrapperProviderId: () => false,
+      providerPriceEntryFor: () => (priced ? { priced: true, entry: prices.models['deepseek-flash'], currency: 'USD', billingMode: 'deepseek-peak' } : { priced: false, entry: {}, currency: 'USD' }),
+      isPeakHour: () => tierName === 'peak',
+      tierFor: (entry) => entry,
+      costOf: (buckets, entry) => (buckets.input * entry.cacheMiss + buckets.output * entry.output + buckets.cacheRead * entry.cacheHit) / 1e6,
+      usdFromCost: (cost, currency, rate) => (currency === 'CNY' ? cost / rate : cost),
+      formatMoney: (usd, view) => {
+        const value = usd * view.exchangeRate
+        let decimals = view.decimals
+        if (value > 0 && value < 10 ** -decimals) decimals += 2
+        const fixed = value.toFixed(decimals)
+        return view.symbol + (fixed.includes('.') ? fixed.replace(/0+$/, '').replace(/\.$/, '') : fixed)
+      },
+    },
+  }
+}
+
+const PRICES = {
+  models: {
+    'deepseek-flash': { cacheHit: 0.2, cacheMiss: 2, output: 8, billingMode: 'deepseek-peak', offPeak: { cacheHit: 0.2, cacheMiss: 2, output: 8 } },
   },
-})
-apply(usageCtx.ctx, { priceInputPerM: 2, priceOutputPerM: 8 })
+  default: { cacheHit: 0.3, cacheMiss: 3, output: 9, billingMode: 'deepseek-peak' },
+}
+const DISPLAY = { currency: 'CNY', symbol: '¥', decimals: 4, exchangeRate: 7.2 }
+
+function usageStream() {
+  return async function* stream() {
+    yield { type: 'text-delta', index: 0, text: '带用量' }
+    yield { type: 'usage', usage: { inputTokens: 1000, outputTokens: 500, cacheReadTokens: 200, totalTokens: 1700 } }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+}
+
+routes.length = 0
+__setPricingContextForTest(makeFakePricing({ prices: PRICES, display: DISPLAY }))
+const usageCtx = makeCtx({ llmStream: usageStream() })
+apply(usageCtx.ctx, {})
 const usageRes = await call(routes[0].handler, {
   method: 'POST',
   url: '/prompt-enhance/enhance',
@@ -483,13 +532,25 @@ check(
   usageBody?.usage?.inputTokens === 1000 && usageBody?.usage?.outputTokens === 500,
   JSON.stringify(usageBody?.usage),
 )
+// (1000*2 + 500*8 + 200*0.2)/1e6 = 0.00604 USD × 7.2 = ¥0.043488 -> ¥0.0435
+const expectedUsd = (1000 * 2 + 500 * 8 + 200 * 0.2) / 1e6
 check(
-  '按配置单价估算费用（1000/1M*2 + 500/1M*8）',
-  Math.abs((usageBody?.cost ?? 0) - 0.006) < 1e-9 && usageBody?.currency === 'CNY',
-  JSON.stringify({ cost: usageBody?.cost, currency: usageBody?.currency }),
+  '按 cost-meter 价目表估算本次费用',
+  usageBody?.cost?.source === 'dsh-cost-meter' &&
+    usageBody?.cost?.priced === true &&
+    Math.abs((usageBody?.cost?.usd ?? 0) - expectedUsd) < 1e-12 &&
+    usageBody?.cost?.currency === 'CNY',
+  JSON.stringify(usageBody?.cost),
 )
+check(
+  '费用按展示币种与小数位格式化',
+  usageBody?.cost?.text === '¥0.0435' && usageBody?.currency === 'CNY',
+  JSON.stringify({ text: usageBody?.cost?.text, currency: usageBody?.currency }),
+)
+
 const statsRes = await call(routes[0].handler, { method: 'GET', url: '/prompt-enhance/settings' })
-const statsBody = statsRes.json().data.stats
+const snapshot = statsRes.json().data
+const statsBody = snapshot.stats
 check(
   '累计统计包含本次调用',
   statsBody?.calls >= 1 && statsBody?.ok >= 1 && statsBody?.inputTokens >= 1000 && statsBody?.outputTokens >= 500,
@@ -500,6 +561,74 @@ check(
   statsBody?.last?.ok === true && statsBody?.last?.provider === 'deepseek-account',
   JSON.stringify(statsBody?.last),
 )
+check(
+  '快照给出费用来源与累计金额',
+  snapshot.pricing?.available === true &&
+    snapshot.pricing?.source === 'dsh-cost-meter' &&
+    snapshot.pricing?.totalsText === '¥0.0435' &&
+    snapshot.pricing?.lastText === '¥0.0435',
+  JSON.stringify(snapshot.pricing),
+)
+check(
+  '快照给出当前模型的生效单价与档位',
+  snapshot.pricing?.current?.priced === true &&
+    snapshot.pricing?.current?.input === 2 &&
+    snapshot.pricing?.current?.output === 8 &&
+    snapshot.pricing?.current?.tier === 'offPeak' &&
+    snapshot.pricing?.current?.officialCurrency === 'USD',
+  JSON.stringify(snapshot.pricing?.current),
+)
+
+/* ---------------- 11. 价目未收录 / 没装 cost-meter 的兜底 ---------------- */
+routes.length = 0
+__setPricingContextForTest(makeFakePricing({ prices: PRICES, display: DISPLAY, priced: false }))
+const unpricedCtx = makeCtx({ llmStream: usageStream() })
+apply(unpricedCtx.ctx, {})
+const unpricedRes = await call(routes[0].handler, {
+  method: 'POST',
+  url: '/prompt-enhance/enhance',
+  body: JSON.stringify({ text: 'hi' }),
+})
+const unpriced = unpricedRes.json().data
+check(
+  '价目表没有该模型时不编造金额',
+  unpriced?.cost?.source === 'dsh-cost-meter' &&
+    unpriced?.cost?.priced === false &&
+    unpriced?.cost?.text === null &&
+    unpriced?.cost?.reason.includes('没有'),
+  JSON.stringify(unpriced?.cost),
+)
+const unpricedSnapshot = (await call(routes[0].handler, { method: 'GET', url: '/prompt-enhance/settings' })).json().data
+check(
+  '未定价时快照如实说明',
+  unpricedSnapshot.pricing?.available === true && unpricedSnapshot.pricing?.current?.priced === false,
+  JSON.stringify({ pricing: unpricedSnapshot.pricing?.current, totals: unpricedSnapshot.pricing?.totalsText }),
+)
+
+routes.length = 0
+__setPricingContextForTest(null)
+const manualCtx = makeCtx({ llmStream: usageStream() })
+apply(manualCtx.ctx, { priceInputPerM: 2, priceOutputPerM: 8 })
+const manualRes = await call(routes[0].handler, {
+  method: 'POST',
+  url: '/prompt-enhance/enhance',
+  body: JSON.stringify({ text: 'hi' }),
+})
+const manual = manualRes.json().data
+check(
+  '没装 cost-meter 时按兜底单价估算',
+  manual?.cost?.source === 'manual' && Math.abs((manual?.cost?.value ?? 0) - 0.006) < 1e-9 && manual?.cost?.currency === 'CNY',
+  JSON.stringify(manual?.cost),
+)
+const manualSnapshot = (await call(routes[0].handler, { method: 'GET', url: '/prompt-enhance/settings' })).json().data
+check(
+  '兜底模式下快照标注不可用原因',
+  manualSnapshot.pricing?.available === false &&
+    manualSnapshot.pricing?.source === 'manual' &&
+    manualSnapshot.pricing?.note.includes('dsh-cost-meter'),
+  JSON.stringify(manualSnapshot.pricing),
+)
+__resetPricingCacheForTest()
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed')
 process.exit(fail === 0 ? 0 : 1)

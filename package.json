@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-prompt-enhance",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "提示词增强：把输入框里的草稿一键改写成更完整、更可执行的提示词，可撤销",
@@ -21,7 +21,9 @@
     "README.md"
   ],
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "immediately": true,

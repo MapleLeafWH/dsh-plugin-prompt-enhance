@@ -349,8 +349,37 @@ const panelSnapshot = (overrides = {}) => ({
     inputTokens: 1200,
     outputTokens: 800,
     cacheReadTokens: 0,
-    cost: 0.0123,
-    last: { at: Date.now(), durationMs: 900, ok: true, provider: 'deepseek-account', model: 'deepseek-flash', error: null },
+    costUsd: 0.0012,
+    costManual: 0,
+    last: {
+      at: Date.now(),
+      durationMs: 900,
+      ok: true,
+      provider: 'deepseek-account',
+      model: 'deepseek-flash',
+      error: null,
+      cost: { source: 'dsh-cost-meter', priced: true, usd: 0.0002925, value: 0.001955, currency: 'CNY', text: '¥0.002' },
+    },
+  },
+  pricing: {
+    available: true,
+    source: 'dsh-cost-meter',
+    display: { currency: 'CNY', symbol: '¥', decimals: 4, exchangeRate: 6.6862 },
+    totalsText: '¥0.002',
+    lastText: '¥0.002',
+    current: {
+      priced: true,
+      provider: 'deepseek-account',
+      model: 'deepseek-flash',
+      officialCurrency: 'USD',
+      billingMode: 'deepseek-peak',
+      tier: 'offPeak',
+      input: 0.15,
+      cacheHit: 0.003,
+      output: 0.6,
+    },
+    note: '按 dsh-cost-meter 价目表估算',
+    ...(overrides.pricing || {}),
   },
   canWrite: overrides.canWrite === undefined ? true : overrides.canWrite,
   patchPath: '/Users/x/.dsh-beta/profiles/desktop/cordis.patch.yml',
@@ -405,7 +434,7 @@ check(
 check('面板请求 GET /prompt-enhance/settings', calls.fetch.length >= 1 && calls.fetch[0].url === '/prompt-enhance/settings', JSON.stringify(calls.fetch.map((entry) => entry.url)))
 const readyText = allText(readyTree)
 check('运行状态展示启用与默认模型来源', readyText.includes('Enabled') && readyText.includes('agent default'), readyText.slice(0, 200))
-check('运行状态展示累计费用与调用次数', readyText.includes('¥0.0123') && readyText.includes('Calls') && readyText.includes('3'), readyText.slice(0, 300))
+check('运行状态展示累计费用与调用次数', readyText.includes('¥0.002') && readyText.includes('Calls') && readyText.includes('3'), readyText.slice(0, 300))
 check('展示当前生效模型', readyText.includes('deepseek-account / deepseek-flash'), readyText.slice(0, 240))
 check('展示 profile patch 写入位置', readyText.includes('cordis.patch.yml'), readyText.slice(0, 320))
 
@@ -475,12 +504,64 @@ check('有试跑输入框', Boolean(trialTextarea), JSON.stringify(trialTextarea
 trialTextarea.props.onChange({ target: { value: '这个功能怎么实现？' } })
 trialTree = await renderPanel()
 const runButton = findAll(trialTree, (node) => node.type === 'button' && textOf(node).includes('Run'))[0]
-fetchQueue.push({ body: { ok: true, data: { text: '试跑结果', cost: 0.0002, currency: 'CNY', durationMs: 1234, usage: { inputTokens: 10, outputTokens: 20 } } } })
+fetchQueue.push({
+  body: {
+    ok: true,
+    data: {
+      text: '试跑结果',
+      cost: { source: 'dsh-cost-meter', priced: true, usd: 0.00029, value: 0.0019, currency: 'CNY', text: '¥0.002' },
+      currency: 'CNY',
+      durationMs: 1234,
+      usage: { inputTokens: 10, outputTokens: 20 },
+    },
+  },
+})
 await runButton.props.onClick()
 trialTree = await renderPanel()
 const trialText = allText(trialTree)
 check('试跑结果展示增强文本', trialText.includes('试跑结果'), trialText.slice(0, 240))
-check('试跑结果展示用量与费用', trialText.includes('input 10') && trialText.includes('¥0.000200'), trialText.slice(0, 320))
+check('试跑结果展示用量与费用', trialText.includes('input 10') && trialText.includes('¥0.002'), trialText.slice(0, 320))
+
+// 费用口径：装 cost-meter 时展示档位与单价，没装时标注兜底
+resetHooks()
+fetchQueue.push({ body: { ok: true, data: panelSnapshot() } })
+const pricedTree = await renderPanel()
+const pricedText = allText(pricedTree)
+check(
+  '状态卡展示 cost-meter 累计费用',
+  pricedText.includes('¥0.002'),
+  pricedText.slice(0, 320),
+)
+check(
+  '费用来源行给出档位与单价',
+  pricedText.includes('dsh-cost-meter price table') && pricedText.includes('off-peak tier') && pricedText.includes('$0.15/M'),
+  pricedText.slice(0, 480),
+)
+
+resetHooks()
+fetchQueue.push({
+  body: {
+    ok: true,
+    data: panelSnapshot({
+      pricing: {
+        available: false,
+        source: 'manual',
+        display: { currency: 'CNY', symbol: '¥', decimals: 4, exchangeRate: 1 },
+        totalsText: '¥0.0000',
+        lastText: null,
+        current: null,
+        note: '未检测到 dsh-cost-meter',
+      },
+    }),
+  },
+})
+const manualTree = await renderPanel()
+const manualText = allText(manualTree)
+check(
+  '没装 cost-meter 时标注兜底口径',
+  manualText.includes('fallback unit price (no dsh-cost-meter)') && manualText.includes('Only used as a fallback'),
+  manualText.slice(0, 480),
+)
 
 globalThis.fetch = realFetch
 console.log('\n' + pass + ' passed, ' + fail + ' failed')

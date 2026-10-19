@@ -96,12 +96,24 @@ Client 半的处理：
 | | `provider` / `model` | 空 | 同时填写才覆盖；空 = 跟随 `agentDefaultModel` |
 | | `timeoutMs` | `300000` | 与 WorkBuddy sidecar 的 3e5ms 对齐；范围 1000–600000 |
 | | `maxTokens` / `temperature` | 空 | 留空 = 不下发，交给适配器默认（与 WorkBuddy 一致） |
-| | `priceInputPerM` / `priceOutputPerM` | `0` | 单价（货币/百万 token），只用于估算 |
-| | `currency` | `CNY` | `CNY` / `USD` |
+| | `priceInputPerM` / `priceOutputPerM` | `0` | **兜底**单价（货币/百万 token）：只在没装 `dsh-cost-meter` 时用于估算 |
+| | `currency` | `CNY` | 兜底估算的币种：`CNY` / `USD` |
 | 提示词模板 | `systemPrompt` / `userTemplate` | 内置 WorkBuddy 原文 | 可编辑；`userTemplate` 必须保留 `{input}`；「恢复默认」= 改回内置文本 |
 | 一键试跑 | — | — | 用**已保存**的配置真实调一次模型，展示结果、tokens、耗时、估算费用 |
 
 保存走官方 `configEditor` 服务：保留 profile patch 里的注释、原子写盘、写完后 Loader 重新 apply 本插件，不需要重启应用。与默认值相同的项不会写进 patch，「恢复默认」等于把那一项删掉。模板逐字等于内置原文时同样视为未覆盖。
+
+## 费用估算
+
+装没装 `dsh-cost-meter`，费用口径不同，面板会明确标出来源：
+
+| 条件 | 费用来源 | 算法 |
+| --- | --- | --- |
+| 已装 `dsh-cost-meter` | 它的价目表 | 运行时动态载入它 `lib/pricing.js` 的纯函数：`providerPriceEntryFor` 找价 → `costOf` 按三桶（cacheMiss / cacheHit / output）与峰谷档计价 → `usdFromCost` 折美元 → `formatMoney` 按它的币种/小数位/汇率显示。价目表、峰谷窗口、`priceOverrides`、汇率都直接读它 `storages/cost-meter/ledger.json` 里的配置，所以和它的界面数字同源。 |
+| 没装 | 配置里的兜底单价 | `tokens/1M × priceInputPerM` + `tokens/1M × priceOutputPerM`，单价默认 0 时显示 `¥0.0000` 并提示是兜底口径。 |
+| 装了但价目表没收录该模型 | 不编造 | 显示「价目表未收录这个模型，费用无法估算」，而不是给 0 假装免费。 |
+
+注意两点：一是本插件的调用是**带外调用**，不会进 `dsh-cost-meter` 的账本，所以面板里的「累计费用」是插件自己按同一套价格算出来的，不是它账本里的数字；二是计价的 provider/model 是这次请求实际用的（包装层会取上游 provider）。
 
 **方式 B · 手改 YAML**。bundle 自带的 `cordis.patch.yml`，或 profile 的 `cordis.patch.yml`（同 id 覆盖）：
 
@@ -138,8 +150,8 @@ HMR 有 ~2s 的写稳定延迟；装完 **刷新页面** 就能看到按钮，�
 ## 验证
 
 ```bash
-node test/host-routes.mjs   # 56 项：路由/403/参数校验/模板/失败映射/prepareCall，以及配置读写、模板归一、用量与费用统计
-node test/client-smoke.mjs  # 54 项：两个 slot 的注册、按钮状态机与撤销、配置面板（骨架/只读/保存/失败/试跑）
+node test/host-routes.mjs   # 65 项：路由/403/参数校验/模板/失败映射/prepareCall、配置读写、模板归一、用量与费用（含 cost-meter 与兜底两种口径）
+node test/client-smoke.mjs  # 57 项：两个 slot 的注册、按钮状态机与撤销、配置面板（骨架/只读/保存/失败/试跑/费用来源）
 node --check index.js && node --check client.js
 
 # 装好之后：宿主插件路由在 Desktop 的渲染器门禁之后，普通 curl 会拿到 403（预期）
@@ -156,7 +168,7 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:43120/prompt-enhance
 - 输入框进入「活动面板」（语音输入展开）时宿主会隐藏整条 standardControls，按钮随之为隐藏 —— 宿主行为，不是 bug。
 - 不做流式回填：一次性拿到整段文本再写入，逻辑简单、撤销语义清晰。
 - 模型调用失败没有重试（`ctx.llm` 本身不含重试，重试在 agent failed-step 层）；直接报错，用户可再点一次。
-- **费用是估算**：`ctx.llm` 的 `usage` 只给 token 数，金额按配置里的单价折算；单价默认 0，所以默认显示 ¥0.0000。没有接 `dsh-cost-meter`（两者账本口径不同，混用会看不懂）。
+- **费用是估算**：`ctx.llm` 的 `usage` 只给 token 数，金额按 `dsh-cost-meter` 的价目表算（缺装时按兜底单价）。计价引擎是运行时从 profile 目录动态 import 的，属于对 `dsh-cost-meter` 内部模块（`lib/pricing.js`）的复用；它改了大版本接口时这里会载入失败并自动退回兜底单价，不会影响增强功能本身。
 - 统计只在本进程内累计（插件重新 apply 不会清零，但重启应用会）。
 - 配置页表格里的「无权限」指宿主没挂 `configEditor` 服务（例如手改 profile 版本较旧）：此时整个面板只读，保存返回 503 `NO_EDITOR`。
 

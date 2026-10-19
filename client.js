@@ -50,6 +50,15 @@ window.__ModuleLoader__.load({
         'settings.inputTokens': '输入 tokens',
         'settings.outputTokens': '输出 tokens',
         'settings.cost': '估算费用',
+        'settings.costSource': '费用来源',
+        'settings.costSourceCostMeter': 'dsh-cost-meter 价目表',
+        'settings.costSourceManual': '兜底单价（未装 dsh-cost-meter）',
+        'settings.costTier.peak': '峰时档',
+        'settings.costTier.offPeak': '谷时档',
+        'settings.costTier.flat': '固定价',
+        'settings.costUnit': '输入 {input}/M · 输出 {output}/M',
+        'settings.costUnpriced': '价目表未收录这个模型，费用无法估算',
+        'settings.manualPrices': '仅在未安装 dsh-cost-meter 时用于兜底估算',
         'settings.lastCall': '最近一次',
         'settings.lastNone': '还没有调用记录',
         'settings.params': '生成参数',
@@ -116,6 +125,15 @@ window.__ModuleLoader__.load({
         'settings.inputTokens': 'Input tokens',
         'settings.outputTokens': 'Output tokens',
         'settings.cost': 'Estimated cost',
+        'settings.costSource': 'Cost source',
+        'settings.costSourceCostMeter': 'dsh-cost-meter price table',
+        'settings.costSourceManual': 'fallback unit price (no dsh-cost-meter)',
+        'settings.costTier.peak': 'peak tier',
+        'settings.costTier.offPeak': 'off-peak tier',
+        'settings.costTier.flat': 'flat price',
+        'settings.costUnit': 'input {input}/M · output {output}/M',
+        'settings.costUnpriced': 'This model is not in the price table, so cost cannot be estimated',
+        'settings.manualPrices': 'Only used as a fallback when dsh-cost-meter is absent',
         'settings.lastCall': 'Last call',
         'settings.lastNone': 'No calls yet',
         'settings.params': 'Generation parameters',
@@ -570,6 +588,42 @@ window.__ModuleLoader__.load({
      */
     function SettingsPanel(props) {
       const t = typeof props.t === 'function' ? props.t : (key) => fallbackText(key);
+    /** 费用对象（host 侧 cost/pricing）-> 展示文本；缺失时给破折号，不假装是 0。 */
+    function costText(cost, fallbackCurrency) {
+      if (cost !== null && typeof cost === 'object') {
+        if (cost.priced === false) return t('settings.costUnpriced');
+        if (typeof cost.text === 'string' && cost.text !== '') return cost.text;
+        return '—';
+      }
+      if (typeof cost === 'number' && Number.isFinite(cost) && cost > 0) return formatMoney(cost, fallbackCurrency || form.currency);
+      return '—';
+    }
+
+    /** 费用口径说明：优先展示 cost-meter 的档位与单价，缺装时说清是兜底。 */
+    function costSourceNote(pricing) {
+      if (pricing === null || typeof pricing !== 'object') return '';
+      if (pricing.available !== true) {
+        return t('settings.costSource') + '：' + t('settings.costSourceManual');
+      }
+      const current = pricing.current;
+      const head = t('settings.costSource') + '：' + t('settings.costSourceCostMeter');
+      if (current === null || typeof current !== 'object' || current.priced !== true) {
+        return head + ' · ' + t('settings.costUnpriced');
+      }
+      const tier =
+        current.tier === 'peak'
+          ? t('settings.costTier.peak')
+          : current.tier === 'offPeak'
+            ? t('settings.costTier.offPeak')
+            : t('settings.costTier.flat');
+      const symbol = current.officialCurrency === 'CNY' ? '¥' : '$';
+      const unit = t('settings.costUnit')
+        .replace('{input}', symbol + String(current.input))
+        .replace('{output}', symbol + String(current.output));
+      const rate = pricing.display && Number(pricing.display.exchangeRate) > 0 ? String(pricing.display.exchangeRate) : '';
+      return head + ' · ' + tier + ' · ' + unit + (rate === '' ? '' : ' × ' + rate);
+    }
+
       const [phase, setPhase] = React.useState('loading');
       const [snapshot, setSnapshot] = React.useState(null);
       const [form, setForm] = React.useState(null);
@@ -663,7 +717,7 @@ window.__ModuleLoader__.load({
             .replace('{input}', String(usage.inputTokens ?? 0))
             .replace('{output}', String(usage.outputTokens ?? 0))
             .replace('{duration}', String(data.durationMs ?? 0) + ' ms')
-            .replace('{cost}', formatMoney(data.cost, data.currency || form.currency));
+            .replace('{cost}', costText(data.cost, data.currency || form.currency));
           setTrial({ ...trial, busy: false, error: '', result: data.text, meta });
         } catch (error) {
           setTrial({ ...trial, busy: false, error: error && error.message ? error.message : String(error), result: null, meta: '' });
@@ -672,6 +726,7 @@ window.__ModuleLoader__.load({
 
       const stats = snapshot.stats || {};
       const runtime = snapshot.runtime;
+      const pricing = snapshot.pricing || null;
       const readOnlyNote =
         canWrite === false
           ? h('div', { className: 'pe-banner', role: 'status' }, t('settings.readonly'))
@@ -706,7 +761,10 @@ window.__ModuleLoader__.load({
           h(Stat, { label: t('settings.failed'), value: String(stats.failed ?? 0) }),
           h(Stat, { label: t('settings.inputTokens'), value: String(stats.inputTokens ?? 0) }),
           h(Stat, { label: t('settings.outputTokens'), value: String(stats.outputTokens ?? 0) }),
-          h(Stat, { label: t('settings.cost'), value: formatMoney(stats.cost, form.currency) }),
+          h(Stat, {
+            label: t('settings.cost'),
+            value: pricing !== null && typeof pricing.totalsText === 'string' ? pricing.totalsText : formatMoney(0, form.currency),
+          }),
         ),
         h(
           'p',
@@ -720,9 +778,14 @@ window.__ModuleLoader__.load({
               ' · ' +
               String(stats.last.durationMs ?? 0) +
               ' ms' +
+              ' · ' +
+              costText(stats.last.cost, form.currency) +
               (stats.last.error ? ' · ' + stats.last.error : '')
             : t('settings.lastNone'),
         ),
+        costSourceNote(pricing) === ''
+          ? null
+          : h('p', { className: 'pe-note' }, costSourceNote(pricing)),
         snapshot.patchPath
           ? h('p', { className: 'pe-note' }, t('settings.patchPath') + '：' + snapshot.patchPath)
           : null,
@@ -799,7 +862,7 @@ window.__ModuleLoader__.load({
               onChange: (event) => update({ temperature: event.target.value }),
             }),
           ),
-          h(Field, { label: t('settings.priceInput'), ...mark('priceInputPerM') },
+          h(Field, { label: t('settings.priceInput'), hint: t('settings.manualPrices'), ...mark('priceInputPerM') },
             h('input', {
               type: 'number',
               className: 'pe-input',
