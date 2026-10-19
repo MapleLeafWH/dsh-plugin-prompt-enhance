@@ -4,6 +4,14 @@
   "private": true,
   "type": "module",
   "description": "提示词增强：把输入框里的草稿一键改写成更完整、更可执行的提示词，可撤销",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MapleLeafWH/dsh-plugin-prompt-enhance.git"
+  },
+  "homepage": "https://github.com/MapleLeafWH/dsh-plugin-prompt-enhance#readme",
+  "bugs": {
+    "url": "https://github.com/MapleLeafWH/dsh-plugin-prompt-enhance/issues"
+  },
   "icon": "./icon.svg",
   "exports": {
     ".": "./index.js",

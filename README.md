@@ -132,21 +132,42 @@ Client 半的处理：
 
 ## 安装
 
-**方式 A · 脚本（推荐，幂等，可回滚）**
+这是一个**普通包形态的 bundle**（`package.json` 里声明了 `dsh.bundle.patch` 与 `dsh.client`），所以下面三种路径都能装，装完都会自动写进 profile 的 `dsh.profile.bundles`。
 
-```bash
-node install.mjs --dry-run   # 先看计划
-node install.mjs             # 建软链 + 写 profile package.json + 追加 dsh.profile.bundles
-node install.mjs --uninstall # 卸载
+**方式 A · 桌面版应用内（推荐）**
+
+「插件」→「已安装插件」→「安装插件」→ 包名或地址填：
+
+```
+github:MapleLeafWH/dsh-plugin-prompt-enhance
 ```
 
-HMR 有 ~2s 的写稳定延迟；装完 **刷新页面** 就能看到按钮，通常不需要重启。若宿主半没加载，Cmd+Q 完全退出再打开。
+走官方 `plugin_manager` → `installBundle`（`pnpm add` + 登记 bundle + HMR 重组），装完刷新页面就能看到 ✨ 按钮和详情页面板。
 
-注意：**改 Host 半（`index.js`/`cordis.patch.yml`）后必须重启应用**——profile 重组会复用已 import 的模块，改文件不会自动生效（实测 12:14 重组后仍是旧代码）；改 Client 半（`client.js`/locale/icon）刷新页面即可。
+**方式 B · 普通 profile（web / tui / headless）**
 
-**方式 B · Web UI 插件管理页**：安装本地包路径即可（内部就是 `installBundle`：pnpm add + 追加 `dsh.profile.bundles`）。
+`dsh plugin` 把参数转发给 profile 目录里的 pnpm，装完同样自动登记 bundle：
 
-注意：`dsh plugin --profile desktop add ...` 会被 CLI 主动拒绝（desktop profile 只由 Electron 应用管理）。
+```bash
+dsh plugin --profile web add github:MapleLeafWH/dsh-plugin-prompt-enhance
+dsh --profile web --dump-config | grep prompt-enhance   # → - id: prompt-enhance
+```
+
+> 桌面版 profile 名字是 `desktop`，CLI 会直接拒绝：`error: profile "desktop" is managed exclusively by the Electron application`（`@deepseek-ai/dsh/lib/bin.js:36`），所以桌面版走方式 A。
+
+**方式 C · 本地开发（改代码即时生效）**
+
+用目录而不是远端包，pnpm 会建 `link:` 依赖，profile 里读到的是工作区源码：
+
+```bash
+dsh plugin --profile web add /absolute/path/to/dsh-plugin-prompt-enhance
+```
+
+桌面版没有 CLI 通道，等价的手工操作是 `node install.mjs`（建软链 + 写依赖 + 追加 bundles，幂等、可回滚），`node install.mjs --uninstall` 撤销。
+
+卸载：应用内移除，或 `dsh plugin --profile web remove dsh-plugin-prompt-enhance`。
+
+改 **Host 半**（`index.js` / `cordis.patch.yml`）后必须重启应用——profile 重组会复用已 import 的模块，改文件不会自动生效（实测 12:14 重组后仍是旧代码）；改 **Client 半**（`client.js` / locale / icon）刷新页面即可。
 
 ## 验证
 
@@ -181,7 +202,7 @@ dsh-plugin-prompt-enhance/
 ├── client.js           # Client：输入框 ✨ 按钮 + 插件详情页配置面板
 ├── cordis.patch.yml    # bundle 层：插入 prompt-enhance 条目与默认 config
 ├── package.json        # dsh.bundle.patch / dsh.client 声明
-├── install.mjs         # 手动安装/卸载脚本
+├── install.mjs         # 桌面版手工安装/卸载（desktop profile 没有 CLI 通道）
 ├── locale/{en,zh}.json # 列表展示用的 meta.title / description
 ├── icon.svg
 └── test/
