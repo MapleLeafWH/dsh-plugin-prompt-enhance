@@ -342,6 +342,10 @@ const panelSnapshot = (overrides = {}) => ({
   },
   templates: { system: 'SYS-DEFAULT', user: 'USER {input}' },
   runtime: { provider: 'deepseek-account', model: 'deepseek-flash', source: 'agentDefaultModel' },
+  providers: [
+    { id: 'deepseek-account', name: 'DeepSeek 账号' },
+    { id: 'kimi-coding', name: 'kimi-coding' },
+  ],
   stats: {
     calls: 3,
     ok: 2,
@@ -564,5 +568,51 @@ check(
 )
 
 globalThis.fetch = realFetch
+
+// 输入框候选：provider 来自快照里的模型路由，model 来自 Host 的候选接口，同时仍可手填
+resetHooks()
+fetchQueue.push({ body: { ok: true, data: panelSnapshot() } })
+fetchQueue.push({
+  body: {
+    ok: true,
+    data: {
+      provider: 'deepseek-account',
+      models: [
+        { id: 'deepseek-flash', name: 'DeepSeek Flash' },
+        { id: 'deepseek-pro', name: 'DeepSeek Pro' },
+      ],
+    },
+  },
+})
+const comboTree = await renderPanel()
+const providerInput = findAll(comboTree, (node) => node.type === 'input' && node.props.list === 'pe-provider-options')[0]
+check('provider 输入框挂出候选（可下拉）', Boolean(providerInput), JSON.stringify(findAll(comboTree, (n) => n.type === 'input').map((n) => n.props.list)))
+const datalistValues = (tree, id) =>
+  findAll(tree, (node) => node.type === 'datalist' && node.props.id === id)
+    .flatMap((datalist) => (datalist.props.children || []).flat(Infinity))
+    .filter((option) => option && option.props && option.props.value !== undefined)
+    .map((option) => option.props.value)
+const providerValues = datalistValues(comboTree, 'pe-provider-options')
+check(
+  'provider 候选来自 DSH 已注册的模型路由',
+  JSON.stringify(providerValues) === '["deepseek-account","kimi-coding"]',
+  JSON.stringify(providerValues),
+)
+const modelValues = datalistValues(comboTree, 'pe-model-options')
+check(
+  'model 候选来自当前 provider 的候选接口',
+  JSON.stringify(modelValues) === '["deepseek-flash","deepseek-pro"]',
+  JSON.stringify(modelValues),
+)
+check(
+  '候选请求带上了当前生效的 provider',
+  calls.fetch.some((entry) => entry.url === '/prompt-enhance/models?provider=deepseek-account'),
+  JSON.stringify(calls.fetch.map((entry) => entry.url)),
+)
+providerInput.props.onChange({ target: { value: 'my-own-route' } })
+const typedTree = await renderPanel()
+const typedInput = findAll(typedTree, (node) => node.type === 'input' && node.props.list === 'pe-provider-options')[0]
+check('provider 仍可手动输入任意值', typedInput.props.value === 'my-own-route', JSON.stringify(typedInput.props.value))
+
 console.log('\n' + pass + ' passed, ' + fail + ' failed')
 process.exit(fail === 0 ? 0 : 1)

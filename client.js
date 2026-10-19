@@ -66,7 +66,8 @@ window.__ModuleLoader__.load({
         'settings.enabled': '启用提示词增强',
         'settings.enabledHint': '关闭后输入框的 ✨ 按钮调用会被拒绝。',
         'settings.provider': 'Provider',
-        'settings.providerHint': '与 model 同时填写才会覆盖默认模型。',
+        'settings.providerHint': '可下拉选，也可手填；候选来自 DSH 已注册的模型路由。',
+        'settings.modelHint': '可下拉选，也可手填；候选来自当前 provider 自报的模型。',
         'settings.model': 'Model',
         'settings.timeoutMs': '超时（毫秒）',
         'settings.maxTokens': 'maxTokens',
@@ -141,7 +142,8 @@ window.__ModuleLoader__.load({
         'settings.enabled': 'Enable prompt enhancement',
         'settings.enabledHint': 'When off, the composer ✨ call is rejected.',
         'settings.provider': 'Provider',
-        'settings.providerHint': 'Overrides the default model only when model is filled too.',
+        'settings.providerHint': 'Pick from the list or type freely; options are model routes registered in DSH.',
+        'settings.modelHint': 'Pick from the list or type freely; options are the models the current provider advertises.',
         'settings.model': 'Model',
         'settings.timeoutMs': 'Timeout (ms)',
         'settings.maxTokens': 'maxTokens',
@@ -630,7 +632,10 @@ window.__ModuleLoader__.load({
       const [loadError, setLoadError] = React.useState('');
       const [save, setSave] = React.useState({ busy: false, error: '', field: '', ok: '' });
       const [trial, setTrial] = React.useState({ text: '', busy: false, error: '', result: null, meta: '' });
+      const [models, setModels] = React.useState([]);
       const started = React.useRef(false);
+      // 记下已经为哪个 provider 拉过候选，避免每次重渲染都请求一遍。
+      const modelsFor = React.useRef('');
 
       const load = async () => {
         setPhase('loading');
@@ -652,6 +657,21 @@ window.__ModuleLoader__.load({
         started.current = true;
         load();
       }, []);
+
+      // 候选模型只是输入辅助：拉不到就静默留空，不阻塞面板。
+      React.useEffect(() => {
+        if (phase !== 'ready' || form === null) return;
+        const typed = String(form.provider || '').trim();
+        const fallbackProvider = snapshot && snapshot.runtime ? String(snapshot.runtime.provider || '') : '';
+        const provider = typed !== '' ? typed : fallbackProvider;
+        if (provider === '' || modelsFor.current === provider) return;
+        modelsFor.current = provider;
+        requestJson('/prompt-enhance/models?provider=' + encodeURIComponent(provider), {
+          headers: { accept: 'application/json' },
+        })
+          .then((data) => setModels(Array.isArray(data.models) ? data.models : []))
+          .catch(() => setModels([]));
+      }, [phase, form, snapshot]);
 
       if (phase === 'loading') return Skeleton();
       if (phase === 'error') {
@@ -810,21 +830,37 @@ window.__ModuleLoader__.load({
             h('input', {
               type: 'text',
               className: 'pe-input',
+              list: 'pe-provider-options',
               value: form.provider,
               disabled: !canWrite,
-              placeholder: 'deepseek-account',
+              placeholder: (snapshot.providers && snapshot.providers[0] ? snapshot.providers[0].id : 'deepseek-account'),
               onChange: (event) => update({ provider: event.target.value }),
             }),
+            h(
+              'datalist',
+              { id: 'pe-provider-options' },
+              (snapshot.providers || []).map((provider) =>
+                h('option', { key: 'provider-' + provider.id, value: provider.id, label: provider.name }),
+              ),
+            ),
           ),
-          h(Field, { label: t('settings.model'), ...mark('model') },
+          h(Field, { label: t('settings.model'), hint: t('settings.modelHint'), ...mark('model') },
             h('input', {
               type: 'text',
               className: 'pe-input',
+              list: 'pe-model-options',
               value: form.model,
               disabled: !canWrite,
               placeholder: 'deepseek-flash',
               onChange: (event) => update({ model: event.target.value }),
             }),
+            h(
+              'datalist',
+              { id: 'pe-model-options' },
+              models.map((model) =>
+                h('option', { key: 'model-' + model.id, value: model.id, label: model.name }),
+              ),
+            ),
           ),
           h(Field, { label: t('settings.timeoutMs'), ...mark('timeoutMs') },
             h('input', {

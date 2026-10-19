@@ -630,5 +630,87 @@ check(
 )
 __resetPricingCacheForTest()
 
+
+/* ---------------- 12. provider / model 候选 ---------------- */
+routes.length = 0
+const modelQueries = []
+const catalogCtx = makeCtx({
+  services: {
+    llm: {
+      async *stream() {
+        yield { type: 'text-delta', index: 0, text: 'x' }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+      async listProviders() {
+        return [
+          { id: 'deepseek-account', name: 'DeepSeek 账号' },
+          { id: 'kimi-coding', name: 'kimi-coding' },
+        ]
+      },
+      async listModels(provider) {
+        modelQueries.push(provider)
+        if (provider === 'kimi-coding') return [{ provider, id: 'kimi-k2', name: 'Kimi K2' }]
+        return [
+          { provider, id: 'deepseek-flash', name: 'DeepSeek Flash', description: '默认' },
+          { provider, id: 'deepseek-pro', name: 'DeepSeek Pro' },
+        ]
+      },
+    },
+  },
+})
+apply(catalogCtx.ctx, {})
+const catalogRoute = routes[0]
+const catalogSnapshot = (await call(catalogRoute.handler, { method: 'GET', url: '/prompt-enhance/settings' })).json().data
+check(
+  '快照带上已注册的 provider 候选',
+  Array.isArray(catalogSnapshot.providers) &&
+    catalogSnapshot.providers.length === 2 &&
+    catalogSnapshot.providers[0].id === 'deepseek-account' &&
+    catalogSnapshot.providers[0].name === 'DeepSeek 账号',
+  JSON.stringify(catalogSnapshot.providers),
+)
+
+const kimiModels = (await call(catalogRoute.handler, { method: 'GET', url: '/prompt-enhance/models?provider=kimi-coding' })).json().data
+check(
+  '按 provider 查候选模型',
+  kimiModels.provider === 'kimi-coding' && kimiModels.models.length === 1 && kimiModels.models[0].id === 'kimi-k2',
+  JSON.stringify(kimiModels),
+)
+
+const defaultModels = (await call(catalogRoute.handler, { method: 'GET', url: '/prompt-enhance/models' })).json().data
+check(
+  '不传 provider 时跟随生效路由',
+  defaultModels.provider === 'deepseek-account' &&
+    defaultModels.models.map((m) => m.id).join(',') === 'deepseek-flash,deepseek-pro' &&
+    defaultModels.models[0].name === 'DeepSeek Flash',
+  JSON.stringify(defaultModels),
+)
+
+routes.length = 0
+const brokenCatalog = makeCtx({
+  services: {
+    llm: {
+      async *stream() {
+        yield { type: 'text-delta', index: 0, text: 'x' }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+      async listProviders() {
+        return []
+      },
+      async listModels() {
+        throw new Error('adapter 不支持候选列表')
+      },
+    },
+  },
+})
+apply(brokenCatalog.ctx, {})
+const brokenModels = await call(routes[0].handler, { method: 'GET', url: '/prompt-enhance/models?provider=deepseek-account' })
+check(
+  '候选列不出来时不算失败，返回空列表与原因',
+  brokenModels.status === 200 && brokenModels.json().data.models.length === 0 && brokenModels.json().data.note.includes('adapter 不支持'),
+  brokenModels.payload,
+)
+routes.length = 0
+
 console.log('\n' + pass + ' passed, ' + fail + ' failed')
 process.exit(fail === 0 ? 0 : 1)

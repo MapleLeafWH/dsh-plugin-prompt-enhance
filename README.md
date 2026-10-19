@@ -39,6 +39,7 @@
 - Client 侧 **只 require('react')**：不碰 `@deepseek-ai/*` 的 primitives，图标与样式内联，通过 `ctx.locale.register()` 拿 `t`。
 - 路由**自带同源校验**（loopback host + `sec-fetch-site` + `Origin`），非 loopback / 跨站一律 403 —— 和 agent-db-ui 一致。
 - 热重载撞到旧路由只 `logger.warn`，不让插件挂掉；插槽与路由都挂在 `ctx.effect` 里，停用即回收。
+- Host 路由：`POST /prompt-enhance/enhance`（增强）、`GET|PUT /prompt-enhance/settings`（配置快照/保存）、`GET /prompt-enhance/models?provider=`（候选模型）。
 
 ## 提示词策略（1:1 对齐 WorkBuddy 5.8.3）
 
@@ -93,7 +94,7 @@ Client 半的处理：
 | --- | --- | --- | --- |
 | 运行状态 | 启用 / 生效模型 / 调用次数 / 成功 / 失败 / tokens / 估算费用 / 写入位置 | — | 只读；统计是进程内累计，重启后清零 |
 | 生成参数 | `enabled` | `true` | 关掉后 ✨ 调用返回 409 `DISABLED` |
-| | `provider` / `model` | 空 | 同时填写才覆盖；空 = 跟随 `agentDefaultModel` |
+| | `provider` / `model` | 空 | 可下拉选也可手填；同时填写才覆盖，空 = 跟随 `agentDefaultModel`。provider 候选来自 `ctx.llm.listProviders()`（就是「设置 → 模型」里那批路由），model 候选来自 `ctx.llm.listModels(provider)` |
 | | `timeoutMs` | `300000` | 与 WorkBuddy sidecar 的 3e5ms 对齐；范围 1000–600000 |
 | | `maxTokens` / `temperature` | 空 | 留空 = 不下发，交给适配器默认（与 WorkBuddy 一致） |
 | | `priceInputPerM` / `priceOutputPerM` | `0` | **兜底**单价（货币/百万 token）：只在没装 `dsh-cost-meter` 时用于估算 |
@@ -150,8 +151,8 @@ HMR 有 ~2s 的写稳定延迟；装完 **刷新页面** 就能看到按钮，�
 ## 验证
 
 ```bash
-node test/host-routes.mjs   # 65 项：路由/403/参数校验/模板/失败映射/prepareCall、配置读写、模板归一、用量与费用（含 cost-meter 与兜底两种口径）
-node test/client-smoke.mjs  # 57 项：两个 slot 的注册、按钮状态机与撤销、配置面板（骨架/只读/保存/失败/试跑/费用来源）
+node test/host-routes.mjs   # 71 项：路由/403/参数校验/模板/失败映射/prepareCall、配置读写、模板归一、用量与费用（cost-meter + 兜底）、provider/model 候选
+node test/client-smoke.mjs  # 62 项：两个 slot 的注册、按钮状态机与撤销、配置面板（骨架/只读/保存/失败/试跑/费用来源/候选下拉）
 node --check index.js && node --check client.js
 
 # 装好之后：宿主插件路由在 Desktop 的渲染器门禁之后，普通 curl 会拿到 403（预期）
@@ -176,7 +177,7 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:43120/prompt-enhance
 
 ```
 dsh-plugin-prompt-enhance/
-├── index.js            # Host：增强路由 + 配置读写 + LLM 调用/用量统计
+├── index.js            # Host：增强路由 + 配置读写 + 候选模型 + LLM 调用/用量/费用统计
 ├── client.js           # Client：输入框 ✨ 按钮 + 插件详情页配置面板
 ├── cordis.patch.yml    # bundle 层：插入 prompt-enhance 条目与默认 config
 ├── package.json        # dsh.bundle.patch / dsh.client 声明

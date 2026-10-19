@@ -248,6 +248,61 @@ function profileOf(scope) {
   return profile !== null && typeof profile === 'object' ? profile : {}
 }
 
+/** DSH_HOME：优先用 profileContext 的 home，退而由 profiles/<name> 反推。 */
+function homeOf(scope) {
+  const profile = profileOf(scope)
+  if (typeof profile.home === 'string' && profile.home !== '') return profile.home
+  if (typeof profile.dir === 'string' && profile.dir !== '') return dirname(dirname(profile.dir))
+  return ''
+}
+
+/** 已注册的模型路由（就是设置页「模型」里那批 provider），供配置页下拉候选。 */
+async function providerList(scope) {
+  const llm = peek(scope, 'llm')
+  if (llm === null || llm === undefined || typeof llm.listProviders !== 'function') return []
+  try {
+    const list = await llm.listProviders()
+    if (!Array.isArray(list)) return []
+    const out = []
+    for (const item of list) {
+      if (item === null || typeof item !== 'object') continue
+      const id = typeof item.id === 'string' ? item.id : ''
+      if (id === '') continue
+      out.push({ id, name: typeof item.name === 'string' && item.name !== '' ? item.name : id })
+    }
+    return out
+  } catch (error) {
+    scope.logger?.warn?.('[prompt-enhance] 读取模型路由失败：' + String(error?.message ?? error))
+    return []
+  }
+}
+
+/** 某个 provider 下适配器自报的模型列表，供 model 输入框下拉候选。 */
+async function modelList(scope, provider) {
+  const llm = peek(scope, 'llm')
+  if (llm === null || llm === undefined || typeof llm.listModels !== 'function') {
+    return { error: '宿主没有 llm.listModels，无法列出候选模型' }
+  }
+  try {
+    const list = await llm.listModels(provider)
+    if (!Array.isArray(list)) return { models: [] }
+    const models = []
+    for (const item of list) {
+      if (item === null || typeof item !== 'object') continue
+      const id = typeof item.id === 'string' ? item.id : ''
+      if (id === '') continue
+      models.push({
+        id,
+        name: typeof item.name === 'string' && item.name !== '' ? item.name : id,
+        description: typeof item.description === 'string' ? item.description : '',
+      })
+    }
+    return { models }
+  } catch (error) {
+    return { error: String(error?.message ?? error) }
+  }
+}
+
 /** 动态载入 cost-meter 的纯函数计价引擎（按 profile 目录解析绝对路径）。 */
 async function loadPricingEngine(scope) {
   const now = Date.now()
@@ -275,8 +330,8 @@ async function loadPricingEngine(scope) {
 async function loadCostMeterConfig(scope) {
   const now = Date.now()
   if (pricingCache.config !== null && now - pricingCache.configAt < PRICING_TTL_MS) return pricingCache.config
-  const home = profileOf(scope).home
-  if (typeof home === 'string' && home !== '') {
+  const home = homeOf(scope)
+  if (home !== '') {
     try {
       const raw = await readFile(join(home, 'storages', 'cost-meter', 'ledger.json'), 'utf8')
       const ledger = JSON.parse(raw)
@@ -772,6 +827,7 @@ function createRoutes(scope, config) {
       defaults: { ...DEFAULTS },
       templates: { system: SYSTEM_PROMPT, user: USER_TEMPLATE },
       runtime: target === null ? null : { provider: target.provider, model: target.model, source: target.source },
+      providers: await providerList(scope),
       stats: {
         ...stats,
         last: stats.last === null ? null : { ...stats.last },
@@ -785,6 +841,28 @@ function createRoutes(scope, config) {
   async function handleGetSettings(req, res) {
     const data = await settingsSnapshot()
     sendJson(res, 200, { ok: true, data })
+  }
+
+  /** 候选模型：供配置页 model 输入框的 datalist 用；provider 省略时按生效路由取。 */
+  async function handleListModels(req, res, url) {
+    const wanted = (url.searchParams.get('provider') || '').trim()
+    const target = resolveTarget(scope, config)
+    const provider = wanted !== '' ? wanted : target === null ? '' : target.provider
+    if (provider === '') {
+      sendJson(res, 400, { ok: false, error: { message: '需要一个 provider 才能列出候选模型', code: 'NO_PROVIDER' } })
+      return
+    }
+    if (provider.length > 200 || /[\r\n]/.test(provider)) {
+      sendJson(res, 400, { ok: false, error: { message: 'provider 不合法', code: 'BAD_PROVIDER' } })
+      return
+    }
+    const result = await modelList(scope, provider)
+    if (typeof result.error === 'string') {
+      // 候选只是输入辅助：列不出来不算失败，返回空列表并带上原因。
+      sendJson(res, 200, { ok: true, data: { provider, models: [], note: result.error } })
+      return
+    }
+    sendJson(res, 200, { ok: true, data: { provider, models: result.models } })
   }
 
   /**
@@ -1039,6 +1117,7 @@ function createRoutes(scope, config) {
     const url = new URL(req.url, 'http://localhost')
     const pathname = url.pathname
     const settingsPath = ROUTE_PREFIX + '/settings'
+    const modelsPath = ROUTE_PREFIX + '/models'
     try {
       if (req.method === 'POST' && pathname === ROUTE_APPLY) {
         await handleEnhance(req, res)
@@ -1056,10 +1135,14 @@ function createRoutes(scope, config) {
         sendJson(res, 405, { ok: false, error: { message: '配置接口只支持 GET/PUT' } })
         return
       }
+      if (req.method === 'GET' && pathname === modelsPath) {
+        await handleListModels(req, res, url)
+        return
+      }
       if (req.method === 'GET' && (pathname === ROUTE_PREFIX || pathname === ROUTE_PREFIX + '/')) {
         sendJson(res, 200, {
           ok: true,
-          data: { plugin: 'prompt-enhance', routes: [ROUTE_APPLY, ROUTE_PREFIX + '/settings'] },
+          data: { plugin: 'prompt-enhance', routes: [ROUTE_APPLY, ROUTE_PREFIX + '/settings', ROUTE_PREFIX + '/models'] },
         })
         return
       }
@@ -1097,7 +1180,7 @@ function mountRoutes(owner, webServer, config) {
   const effect = owner.effect || owner.ctx?.effect
   if (typeof effect === 'function') effect(() => dispose)
   owner.logger?.info?.(
-    '[prompt-enhance] routes mounted at ' + ROUTE_PREFIX + ' (prompt rev wb-1:1, config ui rev 2)',
+    '[prompt-enhance] routes mounted at ' + ROUTE_PREFIX + ' (prompt rev wb-1:1, config ui rev 3)',
   )
   return dispose
 }
